@@ -145,6 +145,18 @@ methods) that don't fit on a Class.
 first-class element kinds with dedicated create/read/update operations, not as generic
 classes with a stereotype.
 
+## Built-in profile: `smith::tests`
+
+The following stereotypes ship built-in and cannot be removed:
+
+| Stereotype | Applies to | Tags |
+|------------|-----------|------|
+| (none — `TestCase` is a metaclass) | — | — |
+
+`TestCase` is a **metaclass** (a new element kind extending `Behavior`), not a stereotype on
+Class, with distinct fields (`testCaseId`, `status`, `steps`, `specification`) that do not fit
+on a Class. This mirrors the `smith::requirements` profile decision (see REQ-REQ-006).
+
 ## Relationship to traceability
 
 Requirements and TestCases are the anchors of the traceability chain:
