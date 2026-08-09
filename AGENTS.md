@@ -138,6 +138,14 @@ Load-bearing architecture patterns (refuse violations in review):
 - `docs/architecture/06-tech-stack.md` — chosen stack, rejected alternatives, version pins.
 - `docs/architecture/03-persistence.md` — SQLite schema, transactions, undo semantics.
 
+## Slice Progress Tracking
+
+**Milestones are the single source of truth for which slices remain.** One GitHub milestone
+per slice (`Slice N — <title>`); issue counts and completion percentage render automatically
+in the GitHub UI (repo → Milestones). Implementation issues carry labels `impl` + `slice-N`
+and belong to exactly one milestone. The Projects v2 board **Smith** tracks per-task status;
+milestones track per-slice progress.
+
 ## Runtime/Tooling Preferences
 
 Planned stack (`docs/architecture/06-tech-stack.md`); versions are **not pinned yet** —

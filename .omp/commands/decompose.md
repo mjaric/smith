@@ -13,7 +13,12 @@ Context the agent must follow:
 - Decompose-only: create issues per `.github/ISSUE_TEMPLATE/implementation-task.md`
   (labels `impl` + `slice-N`, wire `--blocked-by`, complete acceptance criteria with one
   named test per `REQ-*` plus the zero-warnings gate).
+- Milestone: every issue belongs to milestone `Slice $1 — <title>` (`gh issue edit N
+  --milestone "..."`). If the milestone does not exist, create it first
+  (`gh api repos/mjaric/smith/milestones -f title="Slice $1 — <title>"`); milestones are the
+  single source of truth for which slices remain and their progress.
 - Board: items auto-add via workflow; verify Status=Backlog and Slice=Slice N, correct via
   GraphQL if needed. Board contract is in `.omp/agents/team-lead.md`.
 - No workers, no PRs, no code, nothing promoted to Ready.
-- Final report: issue list with numbers, dependency graph, REQ coverage table, root issues.
+- Final report: issue list with numbers, dependency graph, REQ coverage table, root issues,
+  and milestone link.
