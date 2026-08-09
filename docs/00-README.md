@@ -21,16 +21,29 @@ read only the relevant spec documents plus this index and proceed without ambigu
 
 ---
 
+## Start here (agents and contributors)
+
+**[CONTRIBUTING.md](./CONTRIBUTING.md)** — read this first. It tells you how to consume this
+spec (implementation mode vs. refinement mode), the reading order, the load-bearing decisions
+you must not relitigate, and the conventions.
+
+**[AGENTS.md](./AGENTS.md)** — the reverse-index. Every `REQ-*`, `INV-*`, defect code,
+design principle, goal, MCP tool, and error code mapped to its definition site, plus an
+outline of every document. Jump from here to the exact doc/section you need.
+
 ## How to read this specification
 
-1. Start with **[01-vision.md](./01-vision.md)** — product vision, goals, non-goals.
-2. Read **[02-glossary.md](./02-glossary.md)** — shared vocabulary; every term is defined once.
-3. Read the **research/** documents for authoritative background (OMG UML spec, MCP, graph DB,
+1. **[CONTRIBUTING.md](./CONTRIBUTING.md)** — how to work on the spec (5 minutes).
+2. **[01-vision.md](./01-vision.md)** — product vision, goals, non-goals.
+3. **[02-glossary.md](./02-glossary.md)** — shared vocabulary; every term is defined once.
+4. **[03-design-principles.md](./03-design-principles.md)** — principles P1–P10 (load-bearing).
+5. **[AGENTS.md](./AGENTS.md)** — reverse-index to navigate by ID/topic.
+6. The **research/** documents for authoritative background (OMG UML spec, MCP, graph DB,
    analytics algorithms, visual notation). These are *references*, not implementation specs.
-4. Read the **architecture/** documents for the system design.
-5. Read the **uml-model/**, **analytics/**, **ui-ux/**, and **mcp/** documents for each
+7. The **architecture/** documents for the system design.
+8. The **uml-model/**, **analytics/**, **ui-ux/**, and **mcp/** documents for each
    subsystem's detailed contract.
-6. **[99-implementation-guide.md](./99-implementation-guide.md)** ties it together for
+9. **[99-implementation-guide.md](./99-implementation-guide.md)** ties it together for
    implementers, including a suggested build order.
 
 ## Document map
@@ -39,6 +52,8 @@ read only the relevant spec documents plus this index and proceed without ambigu
 | Doc | Purpose |
 |-----|---------|
 | [00-README.md](./00-README.md) | This index. |
+| [CONTRIBUTING.md](./CONTRIBUTING.md) | **How to work on the spec** (agent instructions, reading order, conventions). Start here. |
+| [AGENTS.md](./AGENTS.md) | **Reverse-index**: every REQ-*/INV-*/D*/P*/G*/tool/error-code → definition site + outline map. |
 | [01-vision.md](./01-vision.md) | Product vision, goals, non-goals, success criteria. |
 | [02-glossary.md](./02-glossary.md) | Shared vocabulary (single source of truth for terms). |
 | [03-design-principles.md](./03-design-principles.md) | Design principles every spec follows. |
