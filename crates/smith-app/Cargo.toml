@@ -1,0 +1,23 @@
+[package]
+name = "smith-app"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+description = "Smith binary: wires the async runtime, logging, and Tauri host"
+
+[lib]
+name = "smith_app_lib"
+crate-type = ["rlib"]
+
+[build-dependencies]
+tauri-build = { workspace = true }
+
+[dependencies]
+tauri = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true
