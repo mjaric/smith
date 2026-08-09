@@ -17,6 +17,12 @@ specification** — no implementation exists yet"). Two modes of work, governed 
 `docs/CONTRIBUTING.md`: **Mode A — implement** from the spec; **Mode B — refine** the spec.
 Everything "planned" below is documented but unbuilt.
 
+
+## Rules
+- use `.agents/worktrees/<WORKTREE_NAME>` to isolate work per GitHub issue when running subagents.
+- branch names refix is one of `feat/*`, `fix/*`, `chore/*`
+
+
 ## Architecture & Data Flow
 
 Single OS process (`docs/architecture/01-system-architecture.md`, `06-tech-stack.md`):
