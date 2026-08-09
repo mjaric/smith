@@ -1,2 +1,6 @@
-target/
+/target
 node_modules/
+ui/dist/
+
+# tauri-build generated artifacts (regenerated on every build)
+crates/*/gen/schemas/
