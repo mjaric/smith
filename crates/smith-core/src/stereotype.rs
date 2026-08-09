@@ -7,8 +7,6 @@
 //! stereotypes can each define a tag of the same name without colliding
 //! (`REQ-MM-009`).
 
-use std::fmt;
-
 use crate::id::ElementId;
 use crate::metaclass::MetaclassKind;
 
@@ -90,9 +88,10 @@ impl AppliedStereotype {
 }
 
 /// Error raised when validating a stereotype application.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum StereotypeError {
     /// The element's metaclass is not in the stereotype's `extended_metaclasses`.
+    #[error("stereotype {stereotype:?} does not extend metaclass {kind}", kind = element_kind.as_str())]
     MetaclassNotExtended {
         /// Name of the stereotype whose extension was violated.
         stereotype: String,
@@ -100,23 +99,6 @@ pub enum StereotypeError {
         element_kind: MetaclassKind,
     },
 }
-
-impl fmt::Display for StereotypeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MetaclassNotExtended {
-                stereotype,
-                element_kind,
-            } => write!(
-                f,
-                "stereotype {stereotype:?} does not extend metaclass {kind}",
-                kind = element_kind.as_str()
-            ),
-        }
-    }
-}
-
-impl std::error::Error for StereotypeError {}
 
 /// Validates that `stereotype` may be applied to an element of `element_kind`.
 ///
