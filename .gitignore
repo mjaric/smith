@@ -4,3 +4,4 @@ ui/dist/
 
 # tauri-build generated artifacts (regenerated on every build)
 crates/*/gen/schemas/
+.agents/worktrees
