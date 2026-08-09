@@ -41,6 +41,7 @@ macro_rules! kind_registry {
         impl MetaclassKind {
             /// Every kind in the registry, top-level kinds first.
             pub const ALL: &'static [MetaclassKind] = &[ $( MetaclassKind::$variant ),+ ];
+            /// The stable string identifier for this kind (its spec row name).
             #[must_use]
             pub const fn as_str(self) -> &'static str {
                 match self { $( MetaclassKind::$variant => stringify!($variant) ),+ }

@@ -28,6 +28,26 @@ fn builtin_profiles_present_and_undeletable() {
     // Dependency (docs/architecture/04-traceability-relations.md).
     let traceability = &profiles[0];
     assert_eq!(traceability.stereotypes.len(), 7);
+    // Exact stable identifiers from the normative taxonomy
+    // (docs/architecture/04-traceability-relations.md). A typo here (e.g.
+    // "deriveReq") would silently break downstream name-keyed trace matching.
+    let trace_names: Vec<&str> = traceability
+        .stereotypes
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect();
+    assert_eq!(
+        trace_names,
+        vec![
+            "satisfy",
+            "verify",
+            "realize",
+            "deriveReqt",
+            "refine",
+            "trace",
+            "copy"
+        ]
+    );
     for stereotype in &traceability.stereotypes {
         assert_eq!(
             stereotype.extended_metaclasses,
