@@ -19,9 +19,10 @@ pub struct Multiplicity {
 }
 
 /// Error raised when a multiplicity is malformed or its bounds are inconsistent.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum MultiplicityError {
     /// The upper bound is below the lower bound (`upper < lower`).
+    #[error("multiplicity upper bound {upper} is below lower bound {lower}")]
     UpperBelowLower {
         /// The (too-large) lower bound.
         lower: u32,
@@ -29,28 +30,12 @@ pub enum MultiplicityError {
         upper: u32,
     },
     /// A multiplicity string could not be parsed.
+    #[error("invalid multiplicity {input:?} (expected `1`, `*`, `lower..upper`, or `lower..*`)")]
     InvalidFormat {
         /// The text that failed to parse.
         input: String,
     },
 }
-
-impl fmt::Display for MultiplicityError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::UpperBelowLower { lower, upper } => write!(
-                f,
-                "multiplicity upper bound {upper} is below lower bound {lower}"
-            ),
-            Self::InvalidFormat { input } => write!(
-                f,
-                "invalid multiplicity {input:?} (expected `1`, `*`, `lower..upper`, or `lower..*`)"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for MultiplicityError {}
 
 impl Multiplicity {
     /// Build a multiplicity, rejecting `upper < lower`.

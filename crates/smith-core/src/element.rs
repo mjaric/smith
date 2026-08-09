@@ -5,8 +5,6 @@
 //! not live here. Names are optional and not unique within a namespace
 //! (`REQ-MM-004`); identity (the [`ElementId`]) is the only key.
 
-use std::fmt;
-
 use crate::id::ElementId;
 use crate::stereotype::AppliedStereotype;
 use crate::visibility::Visibility;
@@ -88,21 +86,12 @@ pub struct Comment {
 }
 
 /// Error raised when constructing an invalid [`Comment`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CommentError {
     /// The comment body was empty / whitespace-only.
+    #[error("comment body must be non-empty")]
     EmptyBody,
 }
-
-impl fmt::Display for CommentError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EmptyBody => write!(f, "comment body must be non-empty"),
-        }
-    }
-}
-
-impl std::error::Error for CommentError {}
 
 impl Comment {
     /// Builds a comment, rejecting an empty body (`REQ-MM-011`).
