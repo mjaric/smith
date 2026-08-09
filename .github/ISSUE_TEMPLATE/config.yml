@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Specification
+    url: https://github.com/mjaric/smith/tree/main/docs
+    about: The implementation-ready spec; docs/AGENTS.md is the reverse-index for REQ-* lookups.
