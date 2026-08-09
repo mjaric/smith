@@ -1,0 +1,15 @@
+[package]
+name = "smith-core"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+description = "Pure-Rust UML metamodel domain types: identity, metaclass registry, visibility, multiplicity, stereotype validation"
+
+[dependencies]
+uuid = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true
