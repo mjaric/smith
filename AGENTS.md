@@ -89,13 +89,18 @@ documented commands for implementation work (`docs/CONTRIBUTING.md` §2, `docs/9
 ```bash
 cargo test                                        # Rust tests
 cargo clippy --all-targets -- -D warnings         # zero warnings is the baseline
-vitest                                            # frontend tests
-oxlint                                            # TS lint
+bunx vitest                                       # frontend tests (Bun only — see below)
+bunx oxlint                                       # TS lint
 cargo run                                         # Slice 0 acceptance: opens a window
 ```
 
 Spec editing (Mode B) has no commands: grep-driven cross-reference propagation
 (e.g. `grep -rn 'REQ-MM-001' docs/`) plus a consistency review before finishing.
+
+**Owner override (2026-08-09): the JS toolchain is Bun — runtime, package manager, and
+runner. No Node, npm, yarn, or pnpm, anywhere (scripts, CI, docs).** Where the spec says
+`pnpm`, use Bun instead; treat the spec wording as a known deviation to reconcile in a Mode B
+refinement pass.
 
 ## Code Conventions & Common Patterns
 
@@ -142,7 +147,7 @@ REQ-STACK-004 requires exact pins (`=` in Cargo.toml, no `^`/`~`) at implementat
 |-------|--------|
 | Backend | Rust stable, `cargo` workspace |
 | App shell | Tauri 2.x (baseline 2.9) |
-| Frontend | React 19 + strict TypeScript, **pnpm** workspace |
+| Frontend | React 19 + strict TypeScript, **Bun** workspace (owner override — spec says pnpm) |
 | Canvas | Konva.js 10 (Canvas 2D); elkjs auto-layout in a Web Worker |
 | Persistence | SQLite via `rusqlite` (bundled) — single `.smith` file |
 | Graph algorithms | `petgraph` (in-memory projection) |
