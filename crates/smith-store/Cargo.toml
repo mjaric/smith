@@ -1,0 +1,20 @@
+[package]
+name = "smith-store"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+description = "SQLite persistence for Smith: the .smith file format, schema migrations, and validated JSON data blobs"
+
+[dependencies]
+smith-core = { path = "../smith-core" }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
