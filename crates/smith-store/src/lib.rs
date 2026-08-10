@@ -8,11 +8,14 @@
 //! on every successful open with rotation to the last three versions
 //! (`REQ-PERS-020`). The schema evolves through the append-only migrations in
 //! [`migrations`] (`REQ-PERS-009`, `REQ-PERS-010`); JSON `data` blobs are
-//! serde round-trip helpers in [`data`] (`REQ-PERS-005`).
+//! serde round-trip helpers in [`data`] (`REQ-PERS-005`); ownership-closure-
+//! table maintenance (create/reparent reads, atomic with the owning edge) is
+//! in [`closure`] (`REQ-PERS-007`, `REQ-PERS-008`).
 //!
-//! Non-goals of this crate: closure-table maintenance, the model API, FTS5
-//! search queries, and diagrams CRUD.
+//! Non-goals of this crate: the model API, FTS5 search queries, and diagrams
+//! CRUD.
 
+pub mod closure;
 pub mod data;
 pub mod error;
 pub mod migrations;
