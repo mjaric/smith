@@ -10,7 +10,7 @@
 
 use smith_core::{ElementId, MetaclassKind, Visibility};
 use smith_model::command::{
-    Actor, BatchCommand, CommandStack, CreateElementCommand, DeleteElementCommand,
+    Actor, BatchCommand, Command, CommandStack, CreateElementCommand, DeleteElementCommand,
     RenameElementCommand, ReparentElementCommand,
 };
 use smith_model::{CreateElement, Error, Model};
@@ -430,6 +430,251 @@ fn redo_replays_forward_delta() -> TestResult {
     ensure_eq!(view.owner, Some(root));
     ensure_eq!(view.kind, MetaclassKind::Class);
     ensure_eq!(view.visibility, Visibility::Public);
+
+    Ok(())
+}
+
+// ===========================================================================
+// Finding 1 (P2): rename of an unnamed element — undo restores name to None
+// (prior_name Option<Option<String>> sentinel, not the ambiguous Option<String>)
+// ===========================================================================
+
+#[test]
+fn rename_unnamed_element_undo_restores_none() -> TestResult {
+    let mut model = fresh_model()?;
+    let root = create_root(&mut model, "root")?;
+    let mut stack = CommandStack::new();
+
+    // Create a class with name None (unnamed), under the root.
+    let a = new_id();
+    let mut req = class_req(a, root, "a");
+    req.name = None;
+    stack.execute(&mut model, Box::new(CreateElementCommand::new(req)))?;
+    ensure_eq!(model.get_element(a)?.name.as_deref(), None::<&str>);
+
+    // Rename the unnamed element to Some("x"). Redo captures prior_name = None
+    // (the legitimate prior name), not the "redo never ran" sentinel.
+    stack.execute(
+        &mut model,
+        Box::new(RenameElementCommand::new(a, Some("x".to_string()))),
+    )?;
+    ensure_eq!(model.get_element(a)?.name.as_deref(), Some("x"));
+
+    // Undo must restore the name to None — not reject with CannotUndoRedoBeforeDo.
+    stack.undo(&mut model)?;
+    ensure_eq!(
+        model.get_element(a)?.name.as_deref(),
+        None::<&str>,
+        "undo of a rename on an unnamed element must restore name to None"
+    );
+
+    // Redo re-applies Some("x").
+    stack.redo(&mut model)?;
+    ensure_eq!(model.get_element(a)?.name.as_deref(), Some("x"));
+
+    Ok(())
+}
+
+// ===========================================================================
+// Finding 2 (P3): BatchCommand mid-batch rollback runs in reverse and is
+// not pushed; BatchRollbackFailed surfaces when rollback itself fails
+// ===========================================================================
+
+/// A sub-command whose redo always fails (used to force a mid-batch failure).
+struct FailingRedoCommand {
+    actor: Actor,
+}
+
+impl Command for FailingRedoCommand {
+    fn redo(&mut self, _model: &mut Model) -> Result<(), Error> {
+        Err(Error::ElementNotFound {
+            id: ElementId::new(),
+        })
+    }
+
+    fn undo(&mut self, _model: &mut Model) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn label(&self) -> &'static str {
+        "failing redo"
+    }
+
+    fn actor(&self) -> Actor {
+        self.actor.clone()
+    }
+}
+
+/// A sub-command whose redo succeeds (creates an element) but whose undo
+/// always fails (used to make a batch rollback itself fail).
+struct FailingUndoCommand {
+    id: ElementId,
+    owner: ElementId,
+    actor: Actor,
+}
+
+impl Command for FailingUndoCommand {
+    fn redo(&mut self, model: &mut Model) -> Result<(), Error> {
+        model.create_element(&class_req(self.id, self.owner, "sabotage"))?;
+        Ok(())
+    }
+
+    fn undo(&mut self, _model: &mut Model) -> Result<(), Error> {
+        // Deliberately fail: delete a non-existent element.
+        Err(Error::ElementNotFound {
+            id: ElementId::new(),
+        })
+    }
+
+    fn label(&self) -> &'static str {
+        "failing undo"
+    }
+
+    fn actor(&self) -> Actor {
+        self.actor.clone()
+    }
+}
+
+#[test]
+fn batch_mid_failure_rolls_back_in_reverse_and_is_not_pushed() -> TestResult {
+    let mut model = fresh_model()?;
+    let root = create_root(&mut model, "root")?;
+    let mut stack = CommandStack::new();
+
+    // Batch: create A, create B under A, then delete a non-existent element
+    // (redo fails). The first two must be rolled back in reverse (B then A),
+    // and the batch must not be pushed onto the undo stack.
+    let a = new_id();
+    let b = new_id();
+    let ghost = new_id();
+    let sub_commands: Vec<Box<dyn Command>> = vec![
+        Box::new(CreateElementCommand::new(class_req(a, root, "a"))),
+        Box::new(CreateElementCommand::new(class_req(b, a, "b"))),
+        Box::new(DeleteElementCommand::new(ghost)),
+    ];
+
+    let err = stack
+        .execute(&mut model, Box::new(BatchCommand::new(sub_commands, Actor::Ui)))
+        .err()
+        .ok_or("batch execute should have failed")?;
+    ensure!(
+        matches!(err, Error::ElementNotFound { id } if id == ghost),
+        "batch should fail with ElementNotFound for the ghost, got {err:?}"
+    );
+
+    // The batch was NOT pushed (execute rejects on redo failure).
+    ensure_eq!(stack.len(), 0, "failed batch must not be on the undo stack");
+
+    // Rollback ran in reverse: B is gone, A is gone.
+    ensure!(
+        model.get_element(b).is_err(),
+        "rollback must delete B (created second) before A"
+    );
+    ensure!(
+        model.get_element(a).is_err(),
+        "rollback must delete A after B"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn batch_rollback_failure_surfaces_batch_rollback_failed() -> TestResult {
+    let mut model = fresh_model()?;
+    let root = create_root(&mut model, "root")?;
+    let mut stack = CommandStack::new();
+
+    // Batch: [FailingUndo (redo creates X, undo fails), FailingRedo (redo fails)].
+    // When FailingRedo fails, rollback calls FailingUndo.undo, which also fails
+    // → BatchRollbackFailed (data-integrity error replaces the original).
+    let x = new_id();
+    let sub_commands: Vec<Box<dyn Command>> = vec![
+        Box::new(FailingUndoCommand {
+            id: x,
+            owner: root,
+            actor: Actor::Ui,
+        }),
+        Box::new(FailingRedoCommand { actor: Actor::Ui }),
+    ];
+
+    let err = stack
+        .execute(&mut model, Box::new(BatchCommand::new(sub_commands, Actor::Ui)))
+        .err()
+        .ok_or("batch execute should have failed")?;
+    ensure!(
+        matches!(err, Error::BatchRollbackFailed { .. }),
+        "batch should surface BatchRollbackFailed when rollback fails, got {err:?}"
+    );
+
+    // The batch was not pushed.
+    ensure_eq!(stack.len(), 0, "failed batch must not be on the undo stack");
+
+    // X still exists: the failing-undo command's redo ran, and its (failing)
+    // rollback could not reverse it. This is the documented inconsistency the
+    // error signals.
+    ensure!(
+        model.get_element(x).is_ok(),
+        "X created by the failing-undo command survives a failed rollback"
+    );
+
+    Ok(())
+}
+
+// ===========================================================================
+// Finding 3 (P3): delete-root + undo restores isModel = true (root routed
+// through create_root, not create_element which drops the data blob)
+// ===========================================================================
+
+#[test]
+fn delete_root_undo_restores_is_model_true() -> TestResult {
+    let mut model = fresh_model()?;
+    let root = create_root(&mut model, "root")?;
+    let mut stack = CommandStack::new();
+
+    // The root carries isModel = true before deletion.
+    let data_before: String = {
+        let conn = model.connection();
+        conn.query_row(
+            "SELECT data FROM elements WHERE id = ?1",
+            rusqlite::params![root.as_uuid().to_string()],
+            |row| row.get(0),
+        )?
+    };
+    ensure!(
+        data_before.contains("\"isModel\":true"),
+        "root data must carry isModel=true before delete, got {data_before}"
+    );
+
+    // Delete the root, then undo. Undo must route through create_root so the
+    // root is restored with its isModel flag (create_element would insert "{}").
+    stack.execute(&mut model, Box::new(DeleteElementCommand::new(root)))?;
+    ensure!(
+        model.get_element(root).is_err(),
+        "delete must remove the root"
+    );
+
+    stack.undo(&mut model)?;
+    let view = model.get_element(root)?;
+    ensure_eq!(
+        view.owner,
+        None::<ElementId>,
+        "restored root must have no owner"
+    );
+    ensure_eq!(view.kind, MetaclassKind::Package);
+
+    // The isModel flag is restored (REQ-MM-006).
+    let data_after: String = {
+        let conn = model.connection();
+        conn.query_row(
+            "SELECT data FROM elements WHERE id = ?1",
+            rusqlite::params![root.as_uuid().to_string()],
+            |row| row.get(0),
+        )?
+    };
+    ensure!(
+        data_after.contains("\"isModel\":true"),
+        "undo must restore isModel=true, got {data_after}"
+    );
 
     Ok(())
 }

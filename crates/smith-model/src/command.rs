@@ -172,14 +172,23 @@ impl Command for DeleteElementCommand {
         let view = self.snapshot.clone().ok_or(Error::CannotUndoRedoBeforeDo {
             reason: "delete command has no snapshot; redo was never run",
         })?;
-        let req = CreateElement {
-            id: view.id,
-            kind: view.kind,
-            name: view.name,
-            owner: view.owner,
-            visibility: view.visibility,
-        };
-        model.create_element(&req)?;
+        // The project root (owner is None) carries `{"isModel":true}` in its
+        // `data` blob (`REQ-MM-006`), which `ElementView` does not expose.
+        // `create_element` would insert `data = "{}"`, silently dropping
+        // `isModel`; route root re-creation through `create_root` so the root
+        // is restored with its model flag intact.
+        if view.owner.is_none() {
+            model.create_root(view.id, view.name)?;
+        } else {
+            let req = CreateElement {
+                id: view.id,
+                kind: view.kind,
+                name: view.name,
+                owner: view.owner,
+                visibility: view.visibility,
+            };
+            model.create_element(&req)?;
+        }
         Ok(())
     }
 
@@ -197,8 +206,18 @@ pub struct RenameElementCommand {
     id: ElementId,
     new_name: Option<String>,
     /// The pre-rename name, captured on the first `redo` so the undo delta can
-    /// restore it.
-    prior_name: Option<String>,
+    /// restore it. The outer `Option` is the captured-or-not sentinel; the
+    /// inner `Option` is the (possibly absent) element name — element names are
+    /// nullable, so `None` is a legitimate prior value, not "redo never ran".
+    // Clippy's `option_option` lint is a generic heuristic; here the nesting is
+    // load-bearing: outer = "redo captured a value", inner = "the name was
+    // absent". Collapsing to `Option<String>` reintroduces the sentinel
+    // ambiguity this field exists to fix (see rename_unnamed_element test).
+    #[expect(
+        clippy::option_option,
+        reason = "outer = captured sentinel, inner = nullable name"
+    )]
+    prior_name: Option<Option<String>>,
     actor: Actor,
 }
 
@@ -228,7 +247,7 @@ impl RenameElementCommand {
 
 impl Command for RenameElementCommand {
     fn redo(&mut self, model: &mut Model) -> Result<(), Error> {
-        self.prior_name = model.get_element(self.id)?.name;
+        self.prior_name = Some(model.get_element(self.id)?.name);
         model.rename_element(self.id, self.new_name.as_deref())?;
         Ok(())
     }
@@ -240,7 +259,7 @@ impl Command for RenameElementCommand {
             .ok_or(Error::CannotUndoRedoBeforeDo {
                 reason: "rename command has no prior name; redo was never run",
             })?;
-        model.rename_element(self.id, Some(prior.as_str()))?;
+        model.rename_element(self.id, prior.as_deref())?;
         Ok(())
     }
 
