@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 
 use smith_core::{ElementId, MetaclassKind, Visibility};
-use smith_model::{CreateElement, CreateRelationship, Error, Model};
+use smith_model::{CreateElement, CreateRelationship, EdgeKind, Error, Model, Projection};
 
 /// Deterministic test outcome: helper failures propagate via `?` (no panics).
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -98,6 +98,35 @@ fn create_class(model: &mut Model, owner: ElementId, name: &str) -> Result<Eleme
         visibility: Visibility::Public,
     })?;
     Ok(id)
+}
+
+/// Collect the projection's element ids for stable comparison.
+fn projection_element_ids(proj: &Projection) -> BTreeSet<String> {
+    proj.elements_sorted()
+        .iter()
+        .map(|n| n.id.as_uuid().to_string())
+        .collect()
+}
+
+/// Collect the projection's edges as `(source, target, kind)` tuples for
+/// stable comparison.
+fn projection_edge_set(proj: &Projection) -> BTreeSet<(String, String, String)> {
+    proj.edges_sorted()
+        .iter()
+        .map(|e| {
+            let kind_str = match &e.kind {
+                EdgeKind::Ownership => "ownership".to_string(),
+                EdgeKind::Relationship { id, kind } => {
+                    format!("rel:{kind}:{id:?}")
+                }
+            };
+            (
+                e.source.as_uuid().to_string(),
+                e.target.as_uuid().to_string(),
+                kind_str,
+            )
+        })
+        .collect()
 }
 
 // ===========================================================================
@@ -551,6 +580,11 @@ fn failed_transaction_leaves_store_and_state_unchanged() -> TestResult {
     let a = create_pkg(&mut model, root, "a")?;
     let b = create_class(&mut model, a, "b")?;
 
+    // REQ-PERS-013: a failed mutation must not alter the projection at all.
+    // Snapshot the projection node/edge sets before the failing mutations.
+    let proj_ids_before = projection_element_ids(model.projection());
+    let proj_edges_before = projection_edge_set(model.projection());
+
     // Attempt a reparent that would form a cycle (a into b, its own descendant).
     // This must fail and leave the store unchanged.
     let err = model.reparent_element(a, Some(b));
@@ -575,6 +609,20 @@ fn failed_transaction_leaves_store_and_state_unchanged() -> TestResult {
         );
     }
 
+    // REQ-PERS-013: the projection must be unchanged after the failed reparent.
+    let proj_ids_after = projection_element_ids(model.projection());
+    let proj_edges_after = projection_edge_set(model.projection());
+    ensure_eq!(
+        proj_ids_after,
+        proj_ids_before,
+        "projection nodes must be unchanged after failed reparent"
+    );
+    ensure_eq!(
+        proj_edges_after,
+        proj_edges_before,
+        "projection edges must be unchanged after failed reparent"
+    );
+
     // Attempt to create a relationship referencing a non-existent element.
     // This fails before the transaction starts, so the store is untouched.
     let ghost = new_id();
@@ -598,6 +646,21 @@ fn failed_transaction_leaves_store_and_state_unchanged() -> TestResult {
             "no relationship should exist after failed create"
         );
     }
+
+    // REQ-PERS-013: the projection must still be unchanged after the failed
+    // relationship create.
+    let proj_ids_final = projection_element_ids(model.projection());
+    let proj_edges_final = projection_edge_set(model.projection());
+    ensure_eq!(
+        proj_ids_final,
+        proj_ids_before,
+        "projection nodes must be unchanged after failed relationship create"
+    );
+    ensure_eq!(
+        proj_edges_final,
+        proj_edges_before,
+        "projection edges must be unchanged after failed relationship create"
+    );
     Ok(())
 }
 

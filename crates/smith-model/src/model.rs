@@ -773,12 +773,7 @@ fn read_element_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawElementRow> 
 /// corrupt id or unknown kind instead of fabricating values.
 fn row_to_element_view(raw: RawElementRow) -> Result<ElementView, Error> {
     let kind = kind_from_store(&raw.kind)?;
-    let visibility = match raw.visibility.as_str() {
-        "private" => Visibility::Private,
-        "protected" => Visibility::Protected,
-        "package" => Visibility::Package,
-        _ => Visibility::Public,
-    };
+    let visibility = crate::projection::visibility_from_store(&raw.visibility);
     Ok(ElementView {
         id: parse_id(&raw.id)?,
         kind,
