@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 
-use petgraph::graph::{DiGraph, EdgeIndex, NodeIndex};
+use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
 use smith_core::{ElementId, MetaclassKind, Visibility};
 
@@ -332,14 +332,15 @@ impl Projection {
         let Some(&ix) = self.id_to_node.get(&id) else {
             return;
         };
-        // Remove old incoming ownership edges to this node.
-        let old_incoming: Vec<EdgeIndex> = self
+        // Remove old incoming ownership edges to this node. Remove one at a
+        // time by re-scanning: `remove_edge` is a swap-remove, so indices
+        // collected in a batch go stale after the first removal.
+        while let Some(eix) = self
             .graph
             .edges_directed(ix, petgraph::Direction::Incoming)
-            .filter(|e| e.weight().kind == EdgeKind::Ownership)
+            .find(|e| e.weight().kind == EdgeKind::Ownership)
             .map(|e| e.id())
-            .collect();
-        for eix in old_incoming {
+        {
             self.graph.remove_edge(eix);
         }
         // Update the node's owner field.
@@ -361,9 +362,21 @@ impl Projection {
     }
 
     /// Remove a node and all its edges after a delete.
+    ///
+    /// `petgraph::DiGraph::remove_node` is a swap-remove: when the deleted node
+    /// is not the last, the last node is moved into the vacated index. We remap
+    /// the displaced node's `id → NodeIndex` entry so it still points at the
+    /// correct (now-moved) slot — without this, `node(displaced_id)` would
+    /// index an empty slot (panic) or, once the freed index is reused, silently
+    /// return the wrong element's data.
     pub(crate) fn remove_element(&mut self, id: ElementId) {
         if let Some(ix) = self.id_to_node.remove(&id) {
             self.graph.remove_node(ix);
+            // After swap-remove, the node formerly at the last index now
+            // lives at `ix` — update its map entry if it moved.
+            if let Some(displaced) = self.graph.node_weight(ix) {
+                self.id_to_node.insert(displaced.id, ix);
+            }
         }
     }
 
@@ -387,19 +400,15 @@ impl Projection {
     }
 
     /// Remove a relationship edge after relationship deletion.
+    ///
+    /// `remove_edge` is a swap-remove; re-scan after each removal so we never
+    /// act on a stale edge index.
     pub(crate) fn remove_relationship(&mut self, id: ElementId) {
-        let to_remove: Vec<EdgeIndex> = self
-            .graph
-            .edge_indices()
-            .filter_map(|eix| {
-                let edge = self.graph.edge_weight(eix)?;
-                match &edge.kind {
-                    EdgeKind::Relationship { id: rel_id, .. } if *rel_id == id => Some(eix),
-                    _ => None,
-                }
-            })
-            .collect();
-        for eix in to_remove {
+        while let Some(eix) = self.graph.edge_indices().find(|&eix| {
+            self.graph
+                .edge_weight(eix)
+                .is_some_and(|edge| matches!(&edge.kind, EdgeKind::Relationship { id: rel_id, .. } if *rel_id == id))
+        }) {
             self.graph.remove_edge(eix);
         }
     }
@@ -407,8 +416,7 @@ impl Projection {
     // --- private hydration helpers ---
 
     fn hydrate_nodes(&mut self, conn: &rusqlite::Connection) -> Result<(), Error> {
-        let mut stmt =
-            conn.prepare("SELECT id, kind, owner_id, name, visibility FROM elements")?;
+        let mut stmt = conn.prepare("SELECT id, kind, owner_id, name, visibility FROM elements")?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             let id = parse_id(row.get_ref(0)?.as_str().map_err(rusqlite::Error::from)?)?;
@@ -420,7 +428,8 @@ impl Projection {
                 Err(e) => return Err(rusqlite::Error::from(e).into()),
             };
             let name: Option<String> = row.get(3)?;
-            let visibility = visibility_from_store(row.get_ref(4)?.as_str().map_err(rusqlite::Error::from)?);
+            let visibility =
+                visibility_from_store(row.get_ref(4)?.as_str().map_err(rusqlite::Error::from)?);
             let node = ElementNode {
                 id,
                 kind,
@@ -459,8 +468,7 @@ impl Projection {
             }
         }
         // Relationship edges from relationships table (source → target).
-        let mut stmt =
-            conn.prepare("SELECT id, kind, source_id, target_id FROM relationships")?;
+        let mut stmt = conn.prepare("SELECT id, kind, source_id, target_id FROM relationships")?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             let rel_id = parse_id(row.get_ref(0)?.as_str().map_err(rusqlite::Error::from)?)?;
@@ -486,8 +494,8 @@ impl Projection {
 
 /// Resolve a visibility string from the store into a [`Visibility`].
 ///
-/// Mirrors the logic in `model.rs`'s private `visibility_from_store`. Kept here
-/// as a crate-level function so both modules share one implementation.
+/// The canonical store-string → [`Visibility`] mapping, used by both
+/// projection hydration and `model.rs`'s `row_to_element_view`.
 pub(crate) fn visibility_from_store(s: &str) -> Visibility {
     match s {
         "private" => Visibility::Private,

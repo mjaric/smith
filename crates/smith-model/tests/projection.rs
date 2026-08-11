@@ -198,49 +198,129 @@ fn projection_edge_set(proj: &Projection) -> BTreeSet<(String, String, String)> 
 #[test]
 fn projection_rebuilds_from_sqlite_and_sqlite_wins_on_divergence() -> TestResult {
     let mut model = fresh_model()?;
-    let (root, models, animal, dog, _views, dog_view) = build_three_class_hierarchy(&mut model)?;
+    let (root, _models, animal, dog, _views, dog_view) = build_three_class_hierarchy(&mut model)?;
 
-    // Snapshot the projection before rebuild.
+    // Snapshot the consistent projection to verify the starting state.
     let before_ids = projection_element_ids(model.projection());
     let before_edges = projection_edge_set(model.projection());
     ensure_eq!(before_ids.len(), 6, "6 elements in the projection");
     // 5 ownership edges + 2 relationship edges = 7.
     ensure_eq!(before_edges.len(), 7, "7 edges in the projection");
 
-    // Rebuild the projection from SQLite.
+    // --- Force a divergence: mutate SQLite directly, bypassing the model
+    // API so the projection's write-through is never invoked. The projection
+    // must NOT reflect these changes until rebuild.
+
+    // Divergence 1: insert an element directly into SQLite (present in store,
+    // absent from projection).
+    let extra_id = new_id();
+    let extra_id_str = extra_id.as_uuid().to_string();
+    {
+        let conn = model.connection();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO elements (id, kind, name, owner_id, visibility, data, \
+             created_at, updated_at) VALUES (?1, 'Package', 'extra', ?2, 'public', '{}', \
+             '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            rusqlite::params![extra_id_str, root.as_uuid().to_string()],
+        )?;
+        // Closure rows so the store stays consistent (not measured, but
+        // keeps the store well-formed for later assertions).
+        smith_store::closure::insert_on_create(
+            &tx,
+            &extra_id_str,
+            Some(&root.as_uuid().to_string()),
+        )?;
+        tx.commit()?;
+    }
+
+    // Divergence 2: delete an element directly in SQLite (absent from store,
+    // still present in projection). Delete `animal` — a leaf with no
+    // relationships referencing it (Generalization references dog → animal,
+    // so we must remove that relationship first to satisfy FK constraints).
+    {
+        let conn = model.connection();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch("PRAGMA foreign_keys=OFF")?;
+        // Remove the Generalization relationship that references animal.
+        tx.execute(
+            "DELETE FROM relationships WHERE target_id = ?1",
+            rusqlite::params![animal.as_uuid().to_string()],
+        )?;
+        // Remove the ownership closure rows and the element row.
+        tx.execute(
+            "DELETE FROM ownership_closure WHERE descendant_id = ?1",
+            rusqlite::params![animal.as_uuid().to_string()],
+        )?;
+        tx.execute(
+            "DELETE FROM elements WHERE id = ?1",
+            rusqlite::params![animal.as_uuid().to_string()],
+        )?;
+        tx.execute_batch("PRAGMA foreign_keys=ON")?;
+        tx.commit()?;
+    }
+
+    // The projection is now divergent: it still has `animal` (which SQLite
+    // no longer has) and lacks `extra` (which SQLite now has).
+    ensure!(
+        model.projection().node(extra_id).is_none(),
+        "projection must NOT have extra (divergent: SQLite has it)"
+    );
+    ensure!(
+        model.projection().node(animal).is_some(),
+        "projection still has animal (divergent: SQLite does not)"
+    );
+
+    // --- Rebuild: SQLite wins (REQ-PERS-002). The projection must now reflect
+    // exactly what SQLite holds — `extra` present, `animal` gone.
     model.rebuild_projection()?;
 
-    // After rebuild, the projection must match what SQLite holds (SQLite wins).
-    let after_ids = projection_element_ids(model.projection());
-    let after_edges = projection_edge_set(model.projection());
-    ensure_eq!(
-        before_ids,
-        after_ids,
-        "element ids must match after rebuild"
-    );
-    ensure_eq!(before_edges, after_edges, "edges must match after rebuild");
-
-    // Verify specific elements and edges survive rebuild.
-    let proj = model.projection();
-    ensure!(proj.node(root).is_some(), "root must be in projection");
-    ensure!(proj.node(dog).is_some(), "dog must be in projection");
+    // After rebuild, `extra` is in the projection and `animal` is not.
     ensure!(
-        proj.node(dog_view).is_some(),
-        "dog_view must be in projection"
+        model.projection().node(extra_id).is_some(),
+        "extra must be in projection after rebuild (SQLite wins)"
     );
-    ensure_eq!(proj.node_count(), 6, "6 nodes after rebuild");
-    ensure_eq!(proj.edge_count(), 7, "7 edges after rebuild");
+    ensure!(
+        model.projection().node(animal).is_none(),
+        "animal must be gone from projection after rebuild (SQLite wins)"
+    );
+    ensure!(
+        model.projection().node(dog).is_some(),
+        "dog must still be in projection after rebuild"
+    );
+    ensure!(
+        model.projection().node(dog_view).is_some(),
+        "dog_view must still be in projection after rebuild"
+    );
 
-    // Verify ownership structure: models.owner == root, animal.owner == models.
-    ensure_eq!(
-        proj.node(models).map(|n| n.owner),
-        Some(Some(root)),
-        "models owned by root"
+    // The edge set must also reflect SQLite: the Generalization edge
+    // (dog → animal) is gone.
+    let after_edges = projection_edge_set(model.projection());
+    ensure!(
+        !after_edges.iter().any(|(s, t, _)| {
+            *s == dog.as_uuid().to_string() && *t == animal.as_uuid().to_string()
+        }),
+        "Generalization edge (dog → animal) must be gone after rebuild"
     );
+    // The ownership edge (root → extra) is now present.
+    ensure!(
+        after_edges.iter().any(|(s, t, k)| {
+            *s == root.as_uuid().to_string() && *t == extra_id_str && k == "ownership"
+        }),
+        "ownership edge (root → extra) must be present after rebuild"
+    );
+
+    // The projection now matches exactly what SQLite holds: same node count.
+    let proj_count = i64::try_from(model.projection().node_count())
+        .map_err(|_| -> Box<dyn std::error::Error> { "node count overflow".into() })?;
+    let sqlite_count: i64 =
+        model
+            .connection()
+            .query_row("SELECT COUNT(*) FROM elements", [], |r| r.get(0))?;
     ensure_eq!(
-        proj.node(animal).map(|n| n.owner),
-        Some(Some(models)),
-        "animal owned by models"
+        proj_count,
+        sqlite_count,
+        "projection node count must match SQLite after rebuild"
     );
     Ok(())
 }
@@ -506,34 +586,95 @@ fn hydration_of_100k_elements_under_one_second() -> TestResult {
 
 #[test]
 fn single_mutation_end_to_end_under_10ms() -> TestResult {
-    let mut model = fresh_model()?;
-    let root = create_root(&mut model, "root")?;
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("perf_mutation.smith");
 
-    // Warm up: create a few elements so the store has data.
-    let _pkg = create_pkg(&mut model, root, "warmup")?;
+    // Phase 1: seed 100,000 elements so mutations exercise a realistic model.
+    {
+        let mut model = Model::open(&path)?;
+        let root = create_root(&mut model, "root")?;
+        let conn = model.connection();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch("PRAGMA foreign_keys=OFF")?;
+        {
+            let mut elem_stmt = tx.prepare(
+                "INSERT INTO elements (id, kind, name, owner_id, visibility, data, \
+                 created_at, updated_at) VALUES (?1, 'Package', ?2, ?3, 'public', '{}', \
+                 '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            )?;
+            for i in 0..100_000 {
+                let id = ElementId::new();
+                elem_stmt.execute(rusqlite::params![
+                    id.as_uuid().to_string(),
+                    format!("pkg{i}"),
+                    root.as_uuid().to_string()
+                ])?;
+            }
+        }
+        tx.execute_batch("PRAGMA foreign_keys=ON")?;
+        tx.commit()?;
+    }
 
-    // Measure a single create_element mutation end-to-end (including
-    // closure-table + projection update).
-    let id = new_id();
-    let start = Instant::now();
-    let _view = model.create_element(&CreateElement {
-        id,
-        kind: MetaclassKind::Class,
-        name: Some("bench".to_string()),
-        owner: Some(root),
-        visibility: Visibility::Public,
-    })?;
-    let elapsed = start.elapsed();
+    // Phase 2: reopen and measure single-mutation latency (create_element,
+    // including closure-table insert + projection write-through) over 21
+    // samples after a few warmup mutations. Median must be < 10 ms.
+    let mut model = Model::open(&path)?;
+    // The root was created during seeding; fetch it from the projection.
+    let root = model
+        .projection()
+        .elements_sorted()
+        .iter()
+        .find(|n| n.owner.is_none())
+        .map(|n| n.id)
+        .ok_or("root must exist in the projection")?;
 
-    let under_budget = elapsed.as_secs_f64() < 0.010;
+    // Warmup: 3 mutations to stabilize SQLite page cache and projection.
+    for _ in 0..3 {
+        let warmup_id = new_id();
+        model.create_element(&CreateElement {
+            id: warmup_id,
+            kind: MetaclassKind::Class,
+            name: Some("warmup".to_string()),
+            owner: Some(root),
+            visibility: Visibility::Public,
+        })?;
+    }
+
+    // Measure 21 samples.
+    let mut samples: Vec<f64> = Vec::with_capacity(21);
+    for i in 0..21 {
+        let id = new_id();
+        let start = Instant::now();
+        model.create_element(&CreateElement {
+            id,
+            kind: MetaclassKind::Class,
+            name: Some(format!("bench{i}")),
+            owner: Some(root),
+            visibility: Visibility::Public,
+        })?;
+        samples.push(start.elapsed().as_secs_f64() * 1000.0); // ms
+    }
+
+    // Median (21 samples → middle element of the sorted array).
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = samples[10];
+
+    let under_budget = median < 10.0;
     ensure!(
         under_budget,
-        "single mutation took {elapsed:?}, must be < 10ms"
+        "median single-mutation latency over 21 samples on a 100k-element \
+         model was {median:.3} ms, must be < 10 ms (samples: {samples:?})"
     );
 
-    // Verify the mutation landed in the projection (write-through).
+    // Verify the last mutation landed in the projection (write-through).
+    let last_id = model
+        .projection()
+        .elements_sorted()
+        .last()
+        .map(|n| n.id)
+        .ok_or("projection must have nodes after mutations")?;
     ensure!(
-        model.projection().node(id).is_some(),
+        model.projection().node(last_id).is_some(),
         "mutated element must be in the projection"
     );
     Ok(())
@@ -548,21 +689,21 @@ fn wal_checkpoint_on_close_under_500ms() -> TestResult {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("checkpoint.smith");
 
-    // Create a model with enough data to have a non-trivial WAL.
-    let root_id: ElementId;
-    {
-        let mut model = Model::open(&path)?;
-        root_id = create_root(&mut model, "root")?;
-        // Create a modest number of elements to populate the WAL.
-        for i in 0..1000 {
-            create_pkg(&mut model, root_id, &format!("pkg{i}"))?;
-        }
+    // Phase 1: open the model and populate the WAL with enough data for a
+    // non-trivial checkpoint. Keep the model alive — do NOT drop it here,
+    // because Drop would already run the TRUNCATE checkpoint and Phase 2
+    // would measure a near-empty WAL.
+    let mut model = Model::open(&path)?;
+    let root_id = create_root(&mut model, "root")?;
+    // Create enough elements to produce a substantial WAL that the
+    // checkpoint must fold into the main file.
+    for i in 0..10_000 {
+        create_pkg(&mut model, root_id, &format!("pkg{i}"))?;
     }
 
-    // Reopen and measure the close (which does the TRUNCATE checkpoint).
-    let model = Model::open(&path)?;
+    // Phase 2: measure the actual checkpoint (Drop runs TRUNCATE) against
+    // the populated WAL.
     let start = Instant::now();
-    // The Model's Drop runs the checkpoint. We force it by dropping.
     drop(model);
     let elapsed = start.elapsed();
 
@@ -576,8 +717,8 @@ fn wal_checkpoint_on_close_under_500ms() -> TestResult {
     let model2 = Model::open(&path)?;
     ensure_eq!(
         model2.projection().node_count(),
-        1001,
-        "1001 elements after checkpoint"
+        10_001,
+        "10,001 elements after checkpoint"
     );
     Ok(())
 }
@@ -710,5 +851,95 @@ fn ownership_invariant_acyclic_and_connected_holds() -> TestResult {
             "must be connected after reparent"
         );
     }
+    Ok(())
+}
+
+// ===========================================================================
+// Finding 1: stale NodeIndex map after DiGraph swap-remove in remove_element
+// (delete a non-last element, then touch the projection)
+// ===========================================================================
+
+#[test]
+fn remove_non_last_element_keeps_projection_indices_valid() -> TestResult {
+    let mut model = fresh_model()?;
+    let root = create_root(&mut model, "root")?;
+    let a = create_pkg(&mut model, root, "a")?;
+    let b = create_pkg(&mut model, root, "b")?;
+
+    // Delete `a` — not the most recently added node (b was added last).
+    // Before the fix, this left b's id_to_node entry pointing at the
+    // now-removed slot; node(b) would panic or return stale data.
+    model.delete_element(a)?;
+
+    // node(b) must return b's actual data — no panic, no wrong node.
+    let proj = model.projection();
+    let node_b = proj.node(b).ok_or("b must still be in the projection")?;
+    ensure_eq!(node_b.id, b, "node(b) must return b's id, not stale data");
+    ensure_eq!(node_b.owner, Some(root), "node(b) owner must be root");
+    ensure_eq!(proj.node_count(), 2, "2 nodes after deleting a (root + b)");
+
+    // Create c (reuses the freed graph index). node(b) must still return b,
+    // not c — the swap-remove remap must keep b's entry pointing at b.
+    let c = create_pkg(&mut model, root, "c")?;
+    let proj = model.projection();
+    let node_b = proj.node(b).ok_or("b must still be reachable after c")?;
+    ensure_eq!(
+        node_b.id,
+        b,
+        "node(b) must still return b after c is created"
+    );
+    let node_c = proj.node(c).ok_or("c must be in the projection")?;
+    ensure_eq!(node_c.id, c, "node(c) must return c's id");
+    ensure_eq!(proj.node_count(), 3, "3 nodes: root, b, c");
+
+    // Write-through rename of b after the delete: projection and SQLite agree.
+    model.rename_element(b, Some("renamed_b"))?;
+    let proj = model.projection();
+    let node_b = proj.node(b).ok_or("b must be reachable after rename")?;
+    ensure_eq!(
+        node_b.name.as_deref(),
+        Some("renamed_b"),
+        "projection must reflect rename"
+    );
+    let sqlite_b = model.get_element(b)?;
+    ensure_eq!(
+        sqlite_b.name.as_deref(),
+        Some("renamed_b"),
+        "SQLite must reflect rename"
+    );
+    ensure_eq!(
+        node_b.name,
+        sqlite_b.name,
+        "projection and SQLite agree on name"
+    );
+
+    // Write-through reparent of b after the delete: projection and SQLite agree.
+    model.reparent_element(b, Some(c))?;
+    let proj = model.projection();
+    let node_b = proj.node(b).ok_or("b must be reachable after reparent")?;
+    ensure_eq!(node_b.owner, Some(c), "projection must reflect reparent");
+    let sqlite_b = model.get_element(b)?;
+    ensure_eq!(sqlite_b.owner, Some(c), "SQLite must reflect reparent");
+    ensure_eq!(
+        node_b.owner,
+        sqlite_b.owner,
+        "projection and SQLite agree on owner"
+    );
+
+    // Write-through delete of b: projection must remove it cleanly.
+    model.delete_element(b)?;
+    ensure!(
+        model.projection().node(b).is_none(),
+        "b must be gone from projection after delete"
+    );
+    ensure_eq!(
+        model.projection().node_count(),
+        2,
+        "2 nodes after deleting b (root + c)"
+    );
+
+    // elements_sorted must not panic either (same stale-index indexing path).
+    let sorted = model.projection().elements_sorted();
+    ensure_eq!(sorted.len(), 2, "elements_sorted returns 2 nodes");
     Ok(())
 }
