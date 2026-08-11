@@ -21,7 +21,9 @@ use smith_core::ElementId;
 pub enum Error {
     /// The project root was already created (`REQ-MM-006`: exactly one per
     /// project). Creating a second root is rejected.
-    #[error("project root already exists (id {existing:?}); a project has exactly one root package")]
+    #[error(
+        "project root already exists (id {existing:?}); a project has exactly one root package"
+    )]
     RootAlreadyExists {
         /// The id of the existing root package.
         existing: ElementId,
@@ -119,6 +121,30 @@ pub enum Error {
         /// The underlying rusqlite error.
         #[source]
         detail: rusqlite::Error,
+    },
+
+    /// The undo/redo stack is empty (`REQ-PERS-014`).
+    #[error("undo stack is empty")]
+    UndoStackEmpty,
+
+    /// The redo stack is empty (`REQ-PERS-014`).
+    #[error("redo stack is empty")]
+    RedoStackEmpty,
+
+    /// An undo or redo was attempted before the command's `redo` (do) was
+    /// ever run, so the inverse delta is not available (`REQ-PERS-014`).
+    #[error("cannot undo/redo: {reason}")]
+    CannotUndoRedoBeforeDo {
+        /// Why the inverse/forward delta is unavailable.
+        reason: &'static str,
+    },
+
+    /// A batch command failed mid-apply and the rollback also failed
+    /// (`REQ-PERS-014`): the model may be inconsistent.
+    #[error("batch rollback failed: {reason}")]
+    BatchRollbackFailed {
+        /// Why the rollback failed (includes the original failure).
+        reason: String,
     },
 }
 

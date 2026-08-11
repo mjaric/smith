@@ -285,9 +285,7 @@ fn project_root_is_model_package_exactly_one() -> TestResult {
 
     // Exactly one root: creating a second is rejected.
     let second = new_id();
-    let err = model
-        .create_root(second, Some("second".to_string()))
-        .err();
+    let err = model.create_root(second, Some("second".to_string())).err();
     ensure!(
         matches!(err, Some(Error::RootAlreadyExists { .. })),
         "second root should be rejected"
@@ -491,7 +489,9 @@ fn mutation_is_durable_in_sqlite_after_commit() -> TestResult {
     let conn = model2.connection();
     let ancestors = smith_store::closure::ancestors(conn, &cls_id.as_uuid().to_string())?;
     ensure!(
-        ancestors.iter().any(|r| r.id == root_id.as_uuid().to_string()),
+        ancestors
+            .iter()
+            .any(|r| r.id == root_id.as_uuid().to_string()),
         "root must be an ancestor of cls after reopen"
     );
     Ok(())
@@ -558,7 +558,10 @@ fn failed_transaction_leaves_store_and_state_unchanged() -> TestResult {
     let conn = model.connection();
     let a_ancestors = smith_store::closure::ancestors(conn, &a.as_uuid().to_string())?;
     let ancestor_ids: Vec<String> = a_ancestors.into_iter().map(|r| r.id).collect();
-    ensure_eq!(ancestor_ids, vec![a.as_uuid().to_string(), root.as_uuid().to_string()]);
+    ensure_eq!(
+        ancestor_ids,
+        vec![a.as_uuid().to_string(), root.as_uuid().to_string()]
+    );
 
     // Attempt to create a relationship referencing a non-existent element.
     // This fails before the transaction starts, so the store is untouched.
@@ -574,7 +577,11 @@ fn failed_transaction_leaves_store_and_state_unchanged() -> TestResult {
         .err()
         .ok_or("expected error")?;
     let rel_count: i64 = conn.query_row("SELECT COUNT(*) FROM relationships", [], |r| r.get(0))?;
-    ensure_eq!(rel_count, 0, "no relationship should exist after failed create");
+    ensure_eq!(
+        rel_count,
+        0,
+        "no relationship should exist after failed create"
+    );
     Ok(())
 }
 
@@ -653,7 +660,6 @@ fn delete_element_with_children_is_rejected() -> TestResult {
     Ok(())
 }
 
-
 // ===========================================================================
 // Finding 1: create_root is a single transaction setting isModel on insert
 // (REQ-PERS-013 / REQ-MM-006): the root row and its isModel flag commit
@@ -700,7 +706,11 @@ fn create_root_sets_is_model_in_a_single_transaction() -> TestResult {
 
     // Exactly one commit: the row and the flag are a single transaction.
     let count = commits.load(Ordering::SeqCst);
-    ensure_eq!(count, 1, "create_root must commit exactly once, got {count}");
+    ensure_eq!(
+        count,
+        1,
+        "create_root must commit exactly once, got {count}"
+    );
     Ok(())
 }
 
