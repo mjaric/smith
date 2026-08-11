@@ -77,7 +77,7 @@ fn new_id() -> ElementId {
 }
 
 /// Create the project root, returning its id.
-fn create_root(model: &Model, name: &str) -> Result<ElementId, Error> {
+fn create_root(model: &mut Model, name: &str) -> Result<ElementId, Error> {
     let id = new_id();
     model.create_root(id, Some(name.to_string()))?;
     Ok(id)
@@ -112,14 +112,14 @@ fn pkg_req(id: ElementId, owner: ElementId, name: &str) -> CreateElement {
 
 #[test]
 fn command_records_do_and_undo_deltas_and_undo_reverses() -> TestResult {
-    let model = fresh_model()?;
-    let root = create_root(&model, "root")?;
+    let mut model = fresh_model()?;
+    let root = create_root(&mut model, "root")?;
     let mut stack = CommandStack::new();
 
     // --- create: undo reverses (element is deleted) ---
     let a = new_id();
     stack.execute(
-        &model,
+        &mut model,
         Box::new(CreateElementCommand::new(class_req(a, root, "a"))),
     )?;
     let view = model.get_element(a)?;
@@ -127,65 +127,65 @@ fn command_records_do_and_undo_deltas_and_undo_reverses() -> TestResult {
     ensure_eq!(view.owner, Some(root));
 
     // Undo create → A is gone.
-    stack.undo(&model)?;
+    stack.undo(&mut model)?;
     ensure!(
         model.get_element(a).is_err(),
         "undo of create must delete the element"
     );
 
     // Redo create → A is back with the same fields.
-    stack.redo(&model)?;
+    stack.redo(&mut model)?;
     let view = model.get_element(a)?;
     ensure_eq!(view.name.as_deref(), Some("a"));
     ensure_eq!(view.owner, Some(root));
 
     // --- rename: undo reverses (name is restored) ---
     stack.execute(
-        &model,
+        &mut model,
         Box::new(RenameElementCommand::new(a, Some("renamed".to_string()))),
     )?;
     ensure_eq!(model.get_element(a)?.name.as_deref(), Some("renamed"));
 
     // Undo rename → name is "a" again.
-    stack.undo(&model)?;
+    stack.undo(&mut model)?;
     ensure_eq!(model.get_element(a)?.name.as_deref(), Some("a"));
 
     // Redo rename → name is "renamed" again.
-    stack.redo(&model)?;
+    stack.redo(&mut model)?;
     ensure_eq!(model.get_element(a)?.name.as_deref(), Some("renamed"));
 
     // --- reparent: undo reverses (owner is restored) ---
     let b = new_id();
     stack.execute(
-        &model,
+        &mut model,
         Box::new(CreateElementCommand::new(pkg_req(b, root, "b"))),
     )?;
-    stack.execute(&model, Box::new(ReparentElementCommand::new(a, Some(b))))?;
+    stack.execute(&mut model, Box::new(ReparentElementCommand::new(a, Some(b))))?;
     ensure_eq!(model.get_element(a)?.owner, Some(b));
 
     // Undo reparent → A is back under root.
-    stack.undo(&model)?;
+    stack.undo(&mut model)?;
     ensure_eq!(model.get_element(a)?.owner, Some(root));
 
     // Redo reparent → A is under B again.
-    stack.redo(&model)?;
+    stack.redo(&mut model)?;
     ensure_eq!(model.get_element(a)?.owner, Some(b));
 
     // --- delete: undo reverses (element is re-created) ---
     // Reparent A back to root so it can be deleted cleanly (B is its sibling).
-    stack.execute(&model, Box::new(ReparentElementCommand::new(a, Some(root))))?;
+    stack.execute(&mut model, Box::new(ReparentElementCommand::new(a, Some(root))))?;
     // Delete B (no children, no relationships) to keep the tree clean.
-    stack.execute(&model, Box::new(DeleteElementCommand::new(b)))?;
+    stack.execute(&mut model, Box::new(DeleteElementCommand::new(b)))?;
 
     // Delete A.
-    stack.execute(&model, Box::new(DeleteElementCommand::new(a)))?;
+    stack.execute(&mut model, Box::new(DeleteElementCommand::new(a)))?;
     ensure!(
         model.get_element(a).is_err(),
         "delete must remove the element"
     );
 
     // Undo delete → A is re-created with the fields it had before deletion.
-    stack.undo(&model)?;
+    stack.undo(&mut model)?;
     let view = model.get_element(a)?;
     ensure_eq!(view.name.as_deref(), Some("renamed"));
     ensure_eq!(view.kind, MetaclassKind::Class);
@@ -201,14 +201,14 @@ fn command_records_do_and_undo_deltas_and_undo_reverses() -> TestResult {
 
 #[test]
 fn stack_evicts_oldest_beyond_depth_200() -> TestResult {
-    let model = fresh_model()?;
-    let root = create_root(&model, "root")?;
+    let mut model = fresh_model()?;
+    let root = create_root(&mut model, "root")?;
     let mut stack = CommandStack::new();
 
     // Push the first command (will be evicted).
     let first = new_id();
     stack.execute(
-        &model,
+        &mut model,
         Box::new(CreateElementCommand::new(class_req(first, root, "first"))),
     )?;
 
@@ -216,7 +216,7 @@ fn stack_evicts_oldest_beyond_depth_200() -> TestResult {
     for _ in 0..200 {
         let id = new_id();
         stack.execute(
-            &model,
+            &mut model,
             Box::new(CreateElementCommand::new(class_req(id, root, "x"))),
         )?;
     }
@@ -226,7 +226,7 @@ fn stack_evicts_oldest_beyond_depth_200() -> TestResult {
 
     // Undo all 200 remaining commands.
     for _ in 0..200 {
-        stack.undo(&model)?;
+        stack.undo(&mut model)?;
     }
     ensure!(
         !stack.can_undo(),
@@ -249,14 +249,14 @@ fn stack_evicts_oldest_beyond_depth_200() -> TestResult {
 
 #[test]
 fn commands_are_tagged_with_actor() -> TestResult {
-    let model = fresh_model()?;
-    let root = create_root(&model, "root")?;
+    let mut model = fresh_model()?;
+    let root = create_root(&mut model, "root")?;
     let mut stack = CommandStack::new();
 
     // A UI-issued command.
     let id_ui = new_id();
     stack.execute(
-        &model,
+        &mut model,
         Box::new(CreateElementCommand::with_actor(
             class_req(id_ui, root, "ui-created"),
             Actor::Ui,
@@ -266,7 +266,7 @@ fn commands_are_tagged_with_actor() -> TestResult {
     // A session-issued command.
     let id_sess = new_id();
     stack.execute(
-        &model,
+        &mut model,
         Box::new(CreateElementCommand::with_actor(
             class_req(id_sess, root, "session-created"),
             Actor::Session("s1".to_string()),
@@ -280,7 +280,7 @@ fn commands_are_tagged_with_actor() -> TestResult {
     ensure_eq!(actors[1], Actor::Session("s1".to_string()));
 
     // After undoing one, the redo stack still carries its actor tag.
-    stack.undo(&model)?;
+    stack.undo(&mut model)?;
     let redo_actors = stack.redo_actors();
     ensure_eq!(redo_actors.len(), 1);
     ensure_eq!(redo_actors[0], Actor::Session("s1".to_string()));
@@ -294,8 +294,8 @@ fn commands_are_tagged_with_actor() -> TestResult {
 
 #[test]
 fn batch_command_undoes_as_one_unit() -> TestResult {
-    let model = fresh_model()?;
-    let root = create_root(&model, "root")?;
+    let mut model = fresh_model()?;
+    let root = create_root(&mut model, "root")?;
     let mut stack = CommandStack::new();
 
     // Create three elements as one batch.
@@ -308,7 +308,7 @@ fn batch_command_undoes_as_one_unit() -> TestResult {
         })
         .collect();
 
-    stack.execute(&model, Box::new(BatchCommand::new(sub_commands, Actor::Ui)))?;
+    stack.execute(&mut model, Box::new(BatchCommand::new(sub_commands, Actor::Ui)))?;
 
     // All three exist.
     for &id in &ids {
@@ -319,7 +319,7 @@ fn batch_command_undoes_as_one_unit() -> TestResult {
     ensure_eq!(stack.len(), 1, "batch must be one undo unit");
 
     // One undo reverses all three.
-    stack.undo(&model)?;
+    stack.undo(&mut model)?;
     ensure!(!stack.can_undo(), "undo stack empty after batch undo");
 
     for &id in &ids {
@@ -330,7 +330,7 @@ fn batch_command_undoes_as_one_unit() -> TestResult {
     }
 
     // Redo re-creates all three.
-    stack.redo(&model)?;
+    stack.redo(&mut model)?;
     for &id in &ids {
         ensure!(
             model.get_element(id).is_ok(),
@@ -347,14 +347,14 @@ fn batch_command_undoes_as_one_unit() -> TestResult {
 
 #[test]
 fn undo_revalidates_invariants_and_rejects_violation_with_error() -> TestResult {
-    let model = fresh_model()?;
-    let root = create_root(&model, "root")?;
+    let mut model = fresh_model()?;
+    let root = create_root(&mut model, "root")?;
     let mut stack = CommandStack::new();
 
     // Create A under root via the command stack (undo delta: delete A).
     let a = new_id();
     stack.execute(
-        &model,
+        &mut model,
         Box::new(CreateElementCommand::new(class_req(a, root, "a"))),
     )?;
 
@@ -366,7 +366,7 @@ fn undo_revalidates_invariants_and_rejects_violation_with_error() -> TestResult 
     // Undo the create-A command (which would delete A).
     // A now has a child (B), so the undo must be rejected with
     // ElementHasChildren — invariants are re-validated through the model API.
-    let err = stack.undo(&model).err().ok_or("undo should have failed")?;
+    let err = stack.undo(&mut model).err().ok_or("undo should have failed")?;
     ensure!(
         matches!(err, Error::ElementHasChildren { element, count } if element == a && count == 1),
         "undo should reject with ElementHasChildren, got {err:?}"
@@ -394,20 +394,20 @@ fn undo_revalidates_invariants_and_rejects_violation_with_error() -> TestResult 
 
 #[test]
 fn redo_replays_forward_delta() -> TestResult {
-    let model = fresh_model()?;
-    let root = create_root(&model, "root")?;
+    let mut model = fresh_model()?;
+    let root = create_root(&mut model, "root")?;
     let mut stack = CommandStack::new();
 
     // Create A under root.
     let a = new_id();
     stack.execute(
-        &model,
+        &mut model,
         Box::new(CreateElementCommand::new(class_req(a, root, "a"))),
     )?;
     ensure!(model.get_element(a).is_ok());
 
     // Undo: A is deleted (inverse delta replayed).
-    stack.undo(&model)?;
+    stack.undo(&mut model)?;
     ensure!(
         model.get_element(a).is_err(),
         "undo must remove the element"
@@ -416,7 +416,7 @@ fn redo_replays_forward_delta() -> TestResult {
     ensure!(stack.can_redo());
 
     // Redo: A is re-created (forward delta replayed).
-    stack.redo(&model)?;
+    stack.redo(&mut model)?;
     ensure!(
         model.get_element(a).is_ok(),
         "redo must re-create the element"

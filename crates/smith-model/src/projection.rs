@@ -108,9 +108,12 @@ impl Projection {
     /// Returns [`Error::Sqlite`] on store failure, or [`Error::CorruptStore`]
     /// when a row holds an unparseable id or unknown kind.
     pub fn hydrate(conn: &rusqlite::Connection) -> Result<Self, Error> {
+        let node_count = conn
+            .query_row("SELECT COUNT(*) FROM elements", [], |r| r.get::<_, i64>(0))
+            .map_or(0, |n| usize::try_from(n).unwrap_or(0));
         let mut proj = Self {
-            graph: DiGraph::new(),
-            id_to_node: HashMap::new(),
+            graph: DiGraph::with_capacity(node_count, 0),
+            id_to_node: HashMap::with_capacity(node_count),
         };
         proj.hydrate_nodes(conn)?;
         proj.hydration_edges(conn)?;
@@ -128,8 +131,12 @@ impl Projection {
     /// Returns [`Error::Sqlite`] on store failure, or [`Error::CorruptStore`]
     /// when a row holds an unparseable id or unknown kind.
     pub fn rebuild(&mut self, conn: &rusqlite::Connection) -> Result<(), Error> {
-        self.graph = DiGraph::new();
+        let node_count = conn
+            .query_row("SELECT COUNT(*) FROM elements", [], |r| r.get::<_, i64>(0))
+            .map_or(0, |n| usize::try_from(n).unwrap_or(0));
+        self.graph = DiGraph::with_capacity(node_count, 0);
         self.id_to_node.clear();
+        self.id_to_node.reserve(node_count);
         self.hydrate_nodes(conn)?;
         self.hydration_edges(conn)?;
         Ok(())
@@ -401,22 +408,19 @@ impl Projection {
 
     fn hydrate_nodes(&mut self, conn: &rusqlite::Connection) -> Result<(), Error> {
         let mut stmt =
-            conn.prepare("SELECT id, kind, owner_id, name, visibility FROM elements ORDER BY id")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, String>(4)?,
-            ))
-        })?;
-        for row_result in rows {
-            let (id_str, kind_str, owner_str, name, vis_str) = row_result?;
-            let id = parse_id(&id_str)?;
-            let kind = kind_from_store(&kind_str)?;
-            let owner = owner_str.as_deref().map(parse_id).transpose()?;
-            let visibility = visibility_from_store(&vis_str);
+            conn.prepare("SELECT id, kind, owner_id, name, visibility FROM elements")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let id = parse_id(row.get_ref(0)?.as_str().map_err(rusqlite::Error::from)?)?;
+            let kind = kind_from_store(row.get_ref(1)?.as_str().map_err(rusqlite::Error::from)?)?;
+            let owner_str = row.get_ref(2)?.as_str();
+            let owner = match owner_str {
+                Ok(s) => Some(parse_id(s)?),
+                Err(rusqlite::types::FromSqlError::InvalidType) => None,
+                Err(e) => return Err(rusqlite::Error::from(e).into()),
+            };
+            let name: Option<String> = row.get(3)?;
+            let visibility = visibility_from_store(row.get_ref(4)?.as_str().map_err(rusqlite::Error::from)?);
             let node = ElementNode {
                 id,
                 kind,
@@ -431,20 +435,20 @@ impl Projection {
     }
 
     fn hydration_edges(&mut self, conn: &rusqlite::Connection) -> Result<(), Error> {
-        // Ownership edges from elements.owner_id (direct parent → child).
-        let mut stmt = conn
-            .prepare("SELECT owner_id, id FROM elements WHERE owner_id IS NOT NULL ORDER BY id")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        for row_result in rows {
-            let (owner_str, child_str) = row_result?;
-            let owner_id = parse_id(&owner_str)?;
-            let child_id = parse_id(&child_str)?;
-            if let (Some(&owner_ix), Some(&child_ix)) = (
-                self.id_to_node.get(&owner_id),
-                self.id_to_node.get(&child_id),
-            ) {
+        // Ownership edges: iterate the hydrated nodes themselves instead of
+        // re-querying elements. Each node already carries its owner_id.
+        let ownership_pairs: Vec<(ElementId, NodeIndex)> = self
+            .graph
+            .node_indices()
+            .filter_map(|ix| {
+                let node = &self.graph[ix];
+                node.owner.map(|owner_id| (owner_id, ix))
+            })
+            .collect();
+        let ownership_count = ownership_pairs.len();
+        self.graph.reserve_edges(ownership_count);
+        for (owner_id, child_ix) in ownership_pairs {
+            if let Some(&owner_ix) = self.id_to_node.get(&owner_id) {
                 self.graph.add_edge(
                     owner_ix,
                     child_ix,
@@ -456,20 +460,13 @@ impl Projection {
         }
         // Relationship edges from relationships table (source → target).
         let mut stmt =
-            conn.prepare("SELECT id, kind, source_id, target_id FROM relationships ORDER BY id")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })?;
-        for row_result in rows {
-            let (rel_id_str, kind, source_str, target_str) = row_result?;
-            let rel_id = parse_id(&rel_id_str)?;
-            let source_id = parse_id(&source_str)?;
-            let target_id = parse_id(&target_str)?;
+            conn.prepare("SELECT id, kind, source_id, target_id FROM relationships")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let rel_id = parse_id(row.get_ref(0)?.as_str().map_err(rusqlite::Error::from)?)?;
+            let kind: String = row.get(1)?;
+            let source_id = parse_id(row.get_ref(2)?.as_str().map_err(rusqlite::Error::from)?)?;
+            let target_id = parse_id(row.get_ref(3)?.as_str().map_err(rusqlite::Error::from)?)?;
             if let (Some(&source_ix), Some(&target_ix)) = (
                 self.id_to_node.get(&source_id),
                 self.id_to_node.get(&target_id),

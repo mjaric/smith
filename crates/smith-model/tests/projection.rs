@@ -435,11 +435,12 @@ fn hydration_of_100k_elements_under_one_second() -> TestResult {
 
         // Bulk-insert 100k packages under root via a single transaction batch.
         // We bypass the model API for seeding (this test measures hydration,
-        // not mutation speed).
+        // not mutation speed). Only the elements table is seeded — the
+        // projection hydrates from elements + relationships, not the
+        // ownership_closure index, so closure rows are omitted to keep the
+        // measured VACUUM backup honest about what hydration actually reads.
         let conn = model.connection();
         let tx = conn.unchecked_transaction()?;
-        // Disable FK checks temporarily for bulk insert speed; the closure
-        // table is also bulk-seeded.
         tx.execute_batch("PRAGMA foreign_keys=OFF")?;
         {
             let mut elem_stmt = tx.prepare(
@@ -447,20 +448,13 @@ fn hydration_of_100k_elements_under_one_second() -> TestResult {
                  created_at, updated_at) VALUES (?1, 'Package', ?2, ?3, 'public', '{}', \
                  '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
             )?;
-            let mut closure_stmt = tx.prepare(
-                "INSERT INTO ownership_closure (ancestor_id, descendant_id, depth) \
-                 VALUES (?1, ?1, 0), (?2, ?1, 1)",
-            )?;
             for i in 0..100_000 {
                 let id = ElementId::new();
-                let id_str = id.as_uuid().to_string();
                 elem_stmt.execute(rusqlite::params![
-                    &id_str,
+                    id.as_uuid().to_string(),
                     format!("pkg{i}"),
                     root.as_uuid().to_string()
                 ])?;
-                // Closure: root → child (depth 1) + child → child (depth 0).
-                closure_stmt.execute(rusqlite::params![&id_str, root.as_uuid().to_string()])?;
             }
         }
         tx.execute_batch("PRAGMA foreign_keys=ON")?;
