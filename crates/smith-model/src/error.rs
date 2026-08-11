@@ -92,6 +92,17 @@ pub enum Error {
     /// A comment body was empty (`REQ-MM-011`).
     #[error("comment body must be non-empty")]
     EmptyCommentBody,
+    /// A store row is corrupt: a field holds a value the model layer cannot
+    /// interpret (an unparseable id, an unknown metaclass kind, …). This is a
+    /// data-integrity failure surfaced up rather than silently substituted
+    /// (`REQ-ARCH-017`/`REQ-ARCH-018`: never swallow, fail fast with context).
+    #[error("corrupt store row: {field} holds an invalid value ({detail})")]
+    CorruptStore {
+        /// The offending field name (e.g. `"id"`, `"kind"`).
+        field: &'static str,
+        /// What made the value invalid (e.g. the raw string or a short reason).
+        detail: String,
+    },
     /// A store-level error (`SQLite` IO, migration, checkpoint).
     #[error("store error on {path}: {detail}")]
     Store {

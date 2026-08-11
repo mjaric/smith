@@ -137,29 +137,18 @@ impl Model {
     // --- project root -------------------------------------------------------
 
     /// Create the project root: a `Package` with `isModel = true`, no owner
-    /// (`REQ-MM-006`). Exactly one per project; a second is rejected.
+    /// (`REQ-MM-006`). Exactly one per project; a second is rejected. The
+    /// element row (with `isModel` already in its data blob) and the closure
+    /// rows commit in a single transaction (`REQ-PERS-013`): no intermediate
+    /// committed state can durably persist a root without `isModel = true`.
     ///
     /// # Errors
     ///
     /// - [`Error::RootAlreadyExists`] when a root already exists.
     /// - [`Error::Store`] / [`Error::Sqlite`] on store failure.
     pub fn create_root(&self, id: ElementId, name: Option<String>) -> Result<ElementView, Error> {
-        if self.root_id()?.is_some() {
-            // Fetch the existing root id for the error.
-            let conn = self.connection();
-            let existing: String = conn
-                .query_row(
-                    "SELECT id FROM elements WHERE owner_id IS NULL LIMIT 1",
-                    [],
-                    |row| row.get(0),
-                )
-                .optional()?
-                .ok_or(Error::RootAlreadyExists {
-                    existing: ElementId::new(),
-                })?;
-            return Err(Error::RootAlreadyExists {
-                existing: parse_id(&existing),
-            });
+        if let Some(existing) = self.root_id()? {
+            return Err(Error::RootAlreadyExists { existing });
         }
         let req = CreateElement {
             id,
@@ -168,23 +157,24 @@ impl Model {
             owner: None,
             visibility: Visibility::Public,
         };
-        let view = self.create_element(&req)?;
-        // Mark isModel in the data blob.
+        // The root is a Package with isModel = true (REQ-MM-006). Insert the
+        // element row (data already carrying isModel) and the closure rows in
+        // ONE transaction (REQ-PERS-013): no intermediate committed state can
+        // durably persist a root without isModel = true.
         let conn = self.connection();
         let tx = conn.unchecked_transaction()?;
-        tx.execute(
-            "UPDATE elements SET data = ?1 WHERE id = ?2",
-            params![r#"{"isModel":true}"#, id.as_uuid().to_string()],
-        )?;
+        insert_element_row(&tx, &req, r#"{"isModel":true}"#)?;
+        closure::insert_on_create(&tx, &req.id.as_uuid().to_string(), None)?;
         tx.commit()?;
-        Ok(view)
+        self.get_element(req.id)
     }
 
     /// The project root element, if one exists (`REQ-MM-006`).
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Sqlite`] on store failure.
+    /// Returns [`Error::Sqlite`] on store failure, or [`Error::CorruptStore`]
+    /// when a root row holds an unparseable id or unknown kind.
     pub fn root(&self) -> Result<Option<ElementView>, Error> {
         let conn = self.connection();
         let row = conn
@@ -192,10 +182,10 @@ impl Model {
                 "SELECT id, kind, owner_id, name, visibility \
                  FROM elements WHERE owner_id IS NULL LIMIT 1",
                 [],
-                row_to_element_view,
+                read_element_row,
             )
             .optional()?;
-        Ok(row)
+        row.map(row_to_element_view).transpose()
     }
 
     fn root_id(&self) -> Result<Option<ElementId>, Error> {
@@ -207,7 +197,7 @@ impl Model {
                 |row| row.get(0),
             )
             .optional()?;
-        Ok(id.as_deref().map(parse_id))
+        id.as_deref().map(parse_id).transpose()
     }
 
     // --- element CRUD -------------------------------------------------------
@@ -243,7 +233,7 @@ impl Model {
         }
         let conn = self.connection();
         let tx = conn.unchecked_transaction()?;
-        insert_element_row(&tx, req)?;
+        insert_element_row(&tx, req, "{}")?;
         closure::insert_on_create(
             &tx,
             &req.id.as_uuid().to_string(),
@@ -257,18 +247,21 @@ impl Model {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::ElementNotFound`] when no element has this id, or
-    /// [`Error::Sqlite`] on store failure.
+    /// Returns [`Error::ElementNotFound`] when no element has this id,
+    /// [`Error::Sqlite`] on store failure, or [`Error::CorruptStore`] when
+    /// the row holds an unparseable id or unknown kind.
     pub fn get_element(&self, id: ElementId) -> Result<ElementView, Error> {
         let conn = self.connection();
         let row = conn
             .query_row(
                 "SELECT id, kind, owner_id, name, visibility FROM elements WHERE id = ?1",
                 params![id.as_uuid().to_string()],
-                row_to_element_view,
+                read_element_row,
             )
             .optional()?;
-        row.ok_or(Error::ElementNotFound { id })
+        row.map(row_to_element_view)
+            .transpose()?
+            .ok_or(Error::ElementNotFound { id })
     }
 
     /// Rename an element (`name` is mutable, not unique; `REQ-MM-004`).
@@ -359,8 +352,10 @@ impl Model {
     /// Deleting an element that owns children is rejected
     /// (store-level `ON DELETE RESTRICT` on `elements.owner_id`). Deleting
     /// an element referenced by a relationship is rejected (store-level
-    /// `ON DELETE RESTRICT` on `relationships.source_id`/`target_id`). The
-    /// closure table is cleaned by `ON DELETE CASCADE`.
+    /// `ON DELETE RESTRICT` on `relationships.source_id`/`target_id`/\
+    /// `owner_id`); the pre-check covers all three so the surface stays the
+    /// typed [`Error::ElementReferencedByRelationship`] rather than a raw FK
+    /// violation. The closure table is cleaned by `ON DELETE CASCADE`.
     ///
     /// # Errors
     ///
@@ -387,10 +382,16 @@ impl Model {
                 count: usize::try_from(child_count).unwrap_or(0),
             });
         }
-        // Pre-check relationship references (ON DELETE RESTRICT).
+        // Pre-check relationship references (ON DELETE RESTRICT on
+        // source_id, target_id, AND owner_id). Checking owner_id here keeps
+        // the surface consistent: without it, deleting an element that owns
+        // a relationship would pass both pre-checks and then fail inside the
+        // transaction with a raw FK violation.
         let rel_ref: Option<String> = conn
             .query_row(
-                "SELECT id FROM relationships WHERE source_id = ?1 OR target_id = ?1 LIMIT 1",
+                "SELECT id FROM relationships \
+                 WHERE source_id = ?1 OR target_id = ?1 OR owner_id = ?1 \
+                 LIMIT 1",
                 params![id_str],
                 |row| row.get(0),
             )
@@ -398,7 +399,7 @@ impl Model {
         if let Some(rel_id) = rel_ref {
             return Err(Error::ElementReferencedByRelationship {
                 element: id,
-                relationship: parse_id(&rel_id),
+                relationship: parse_id(&rel_id)?,
             });
         }
         let tx = conn.unchecked_transaction()?;
@@ -455,7 +456,9 @@ impl Model {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::RelationshipNotFound`] or [`Error::Sqlite`].
+    /// Returns [`Error::RelationshipNotFound`], [`Error::Sqlite`] on store
+    /// failure, or [`Error::CorruptStore`] when a relationship row holds an
+    /// unparseable id.
     pub fn get_relationship(&self, id: ElementId) -> Result<RelationshipView, Error> {
         let conn = self.connection();
         let row = conn
@@ -463,17 +466,24 @@ impl Model {
                 "SELECT id, kind, source_id, target_id, owner_id FROM relationships WHERE id = ?1",
                 params![id.as_uuid().to_string()],
                 |row| {
-                    Ok(RelationshipView {
-                        id: parse_id(&row.get::<_, String>(0)?),
-                        kind: row.get(1)?,
-                        source: parse_id(&row.get::<_, String>(2)?),
-                        target: parse_id(&row.get::<_, String>(3)?),
-                        owner: parse_id(&row.get::<_, String>(4)?),
-                    })
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
                 },
             )
             .optional()?;
-        row.ok_or(Error::RelationshipNotFound { id })
+        let (id_str, kind, source, target, owner) = row.ok_or(Error::RelationshipNotFound { id })?;
+        Ok(RelationshipView {
+            id: parse_id(&id_str)?,
+            kind,
+            source: parse_id(&source)?,
+            target: parse_id(&target)?,
+            owner: parse_id(&owner)?,
+        })
     }
 
     /// Delete a relationship.
@@ -536,7 +546,9 @@ impl Model {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::ElementNotFound`] or [`Error::Sqlite`].
+    /// Returns [`Error::ElementNotFound`], [`Error::Sqlite`] on store
+    /// failure, or [`Error::CorruptStore`] when a comment row holds an
+    /// unparseable id.
     pub fn get_comment(&self, id: ElementId) -> Result<CommentView, Error> {
         let conn = self.connection();
         let row = conn
@@ -544,15 +556,20 @@ impl Model {
                 "SELECT id, owner_id, body FROM comments WHERE id = ?1",
                 params![id.as_uuid().to_string()],
                 |row| {
-                    Ok(CommentView {
-                        id: parse_id(&row.get::<_, String>(0)?),
-                        owner: parse_id(&row.get::<_, String>(1)?),
-                        body: row.get(2)?,
-                    })
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
                 },
             )
             .optional()?;
-        row.ok_or(Error::ElementNotFound { id })
+        let (id_str, owner, body) = row.ok_or(Error::ElementNotFound { id })?;
+        Ok(CommentView {
+            id: parse_id(&id_str)?,
+            owner: parse_id(&owner)?,
+            body,
+        })
     }
 
     // --- derived reads ------------------------------------------------------
@@ -606,19 +623,25 @@ impl Model {
 // --- free functions ---------------------------------------------------------
 
 /// Insert one element row (the `elements` table insert, no closure).
+///
+/// `data` is the JSON blob written to the `data` column (validated by the
+/// store's `json_valid` CHECK). Callers pass `'{}'` for a plain element and
+/// `{"isModel":true}` for the project root (`REQ-MM-006`).
 fn insert_element_row(
     tx: &rusqlite::Transaction<'_>,
     req: &CreateElement,
+    data: &str,
 ) -> Result<(), Error> {
     tx.execute(
         "INSERT INTO elements (id, kind, name, owner_id, visibility, data, created_at, \
-         updated_at) VALUES (?1, ?2, ?3, ?4, ?5, '{}', ?6, ?6)",
+         updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
         params![
             req.id.as_uuid().to_string(),
             req.kind.as_str(),
             req.name.as_deref(),
             req.owner.map(|o| o.as_uuid().to_string()),
             visibility_str(req.visibility),
+            data,
             NOW,
         ],
     )?;
@@ -642,37 +665,68 @@ fn comment_err(err: &CommentError) -> Error {
     }
 }
 
-/// Parse a UUID string into an [`ElementId`].
-fn parse_id(s: &str) -> ElementId {
-    // ElementId wraps a Uuid; the store stores the hyphenated string form.
-    // Parse is infallible for round-tripped uuids, but we use a safe path.
-    match uuid::Uuid::parse_str(s) {
-        Ok(u) => ElementId::from(u),
-        // Should never happen for ids we wrote; surface as a distinct panic-
-        // free path. A corrupt id in the store is a store bug.
-        Err(_) => ElementId::new(),
-    }
+/// Parse a UUID string from the store into an [`ElementId`].
+///
+/// Fails fast with [`Error::CorruptStore`] when the string is not a valid
+/// UUID — a corrupt id in the store is a data-integrity failure that must be
+/// surfaced, never silently substituted with a fresh random id
+/// (`REQ-ARCH-017`/`REQ-ARCH-018`).
+fn parse_id(s: &str) -> Result<ElementId, Error> {
+    uuid::Uuid::parse_str(s)
+        .map(ElementId::from)
+        .map_err(|_| Error::CorruptStore {
+            field: "id",
+            detail: format!("not a valid UUID: {s:?}"),
+        })
 }
 
-/// Row mapper: `SELECT id, kind, owner_id, name, visibility` → [`ElementView`].
-fn row_to_element_view(row: &rusqlite::Row<'_>) -> rusqlite::Result<ElementView> {
-    let id_str: String = row.get(0)?;
-    let kind_str: String = row.get(1)?;
-    let owner_str: Option<String> = row.get(2)?;
-    let name: Option<String> = row.get(3)?;
-    let vis_str: String = row.get(4)?;
-    let kind = MetaclassKind::from_id(&kind_str).unwrap_or(MetaclassKind::Package);
-    let visibility = match vis_str.as_str() {
+/// Resolve a metaclass kind string from the store into a [`MetaclassKind`].
+///
+/// Fails fast with [`Error::CorruptStore`] when the kind is unknown — an
+/// unrecognized kind is corruption, not a defaultable `Package`.
+fn kind_from_store(s: &str) -> Result<MetaclassKind, Error> {
+    MetaclassKind::from_id(s).ok_or(Error::CorruptStore {
+        field: "kind",
+        detail: format!("unknown metaclass kind: {s:?}"),
+    })
+}
+
+/// The raw string columns of an element row, as read from the store.
+struct RawElementRow {
+    id: String,
+    kind: String,
+    owner: Option<String>,
+    name: Option<String>,
+    visibility: String,
+}
+
+/// Read the five element columns from a row (the `SELECT` projection is
+/// `id, kind, owner_id, name, visibility`).
+fn read_element_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawElementRow> {
+    Ok(RawElementRow {
+        id: row.get(0)?,
+        kind: row.get(1)?,
+        owner: row.get(2)?,
+        name: row.get(3)?,
+        visibility: row.get(4)?,
+    })
+}
+
+/// Build an [`ElementView`] from the raw string columns, failing fast on a
+/// corrupt id or unknown kind instead of fabricating values.
+fn row_to_element_view(raw: RawElementRow) -> Result<ElementView, Error> {
+    let kind = kind_from_store(&raw.kind)?;
+    let visibility = match raw.visibility.as_str() {
         "private" => Visibility::Private,
         "protected" => Visibility::Protected,
         "package" => Visibility::Package,
         _ => Visibility::Public,
     };
     Ok(ElementView {
-        id: parse_id(&id_str),
+        id: parse_id(&raw.id)?,
         kind,
-        owner: owner_str.as_deref().map(parse_id),
-        name,
+        owner: raw.owner.as_deref().map(parse_id).transpose()?,
+        name: raw.name,
         visibility,
     })
 }

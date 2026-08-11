@@ -652,3 +652,155 @@ fn delete_element_with_children_is_rejected() -> TestResult {
     model.delete_element(a)?;
     Ok(())
 }
+
+
+// ===========================================================================
+// Finding 1: create_root is a single transaction setting isModel on insert
+// (REQ-PERS-013 / REQ-MM-006): the root row and its isModel flag commit
+// together — no intermediate committed state can durably persist a root
+// without isModel = true.
+// ===========================================================================
+
+#[test]
+fn create_root_sets_is_model_in_a_single_transaction() -> TestResult {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let model = fresh_model()?;
+
+    // Count commits on the single write connection. create_root must commit
+    // exactly once: the element row (with isModel already in its data blob)
+    // and the closure rows commit together.
+    let commits = Arc::new(AtomicUsize::new(0));
+    let hook = {
+        let c = Arc::clone(&commits);
+        move || {
+            c.fetch_add(1, Ordering::SeqCst);
+            false // do not roll back
+        }
+    };
+    model.connection().commit_hook(Some(hook))?;
+
+    let root_id = new_id();
+    let view = model.create_root(root_id, Some("model".to_string()))?;
+    ensure_eq!(view.kind, MetaclassKind::Package);
+    ensure!(view.owner.is_none(), "root has no owner");
+
+    // The data blob durably carries isModel = true (no second UPDATE needed).
+    let conn = model.connection();
+    let data: String = conn.query_row(
+        "SELECT data FROM elements WHERE id = ?1",
+        rusqlite::params![root_id.as_uuid().to_string()],
+        |r| r.get(0),
+    )?;
+    ensure!(
+        data.contains("\"isModel\":true"),
+        "root data must carry isModel=true, got {data}"
+    );
+
+    // Exactly one commit: the row and the flag are a single transaction.
+    let count = commits.load(Ordering::SeqCst);
+    ensure_eq!(count, 1, "create_root must commit exactly once, got {count}");
+    Ok(())
+}
+
+// ===========================================================================
+// Finding 2: delete_element pre-checks relationships.owner_id (RESTRICT)
+// A relationship owned by the deleted element must surface as the typed
+// ElementReferencedByRelationship error, not a raw FK violation.
+// ===========================================================================
+
+#[test]
+fn delete_element_owned_by_relationship_is_rejected() -> TestResult {
+    let model = fresh_model()?;
+    let root = create_root(&model, "root")?;
+    let pkg = create_pkg(&model, root, "pkg")?;
+    let cls = create_class(&model, root, "cls")?;
+
+    // A self-loop relationship on cls, owned by pkg. Deleting pkg is blocked
+    // by relationships.owner_id (neither source_id nor target_id matches pkg).
+    let rid = new_id();
+    model.create_relationship(&CreateRelationship {
+        id: rid,
+        kind: "Association".to_string(),
+        source: cls,
+        target: cls,
+        owner: pkg,
+    })?;
+
+    // Deleting the relationship's owner (pkg) must surface the typed error.
+    let err = model.delete_element(pkg).err();
+    ensure!(
+        matches!(err, Some(Error::ElementReferencedByRelationship { element, relationship })
+            if element == pkg && relationship == rid),
+        "deleting relationship owner should be rejected with typed error, got {err:?}"
+    );
+
+    // After removing the relationship, the package can be deleted.
+    model.delete_relationship(rid)?;
+    model.delete_element(pkg)?;
+    Ok(())
+}
+
+// ===========================================================================
+// Finding 3: corrupt store rows surface as typed errors, not fabricated
+// values (REQ-ARCH-017/018: fail fast, never swallow). An unparseable id or
+// unknown kind in a store row must return Error::CorruptStore.
+// ===========================================================================
+
+/// Seed a raw element row directly into the store, bypassing the model API,
+/// so a read must interpret the (corrupt) columns.
+fn seed_element_row(
+    model: &Model,
+    id: &str,
+    kind: &str,
+    owner_id: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let conn = model.connection();
+    conn.execute(
+        "INSERT INTO elements (id, kind, name, owner_id, visibility, data, created_at, \
+         updated_at) VALUES (?1, ?2, NULL, ?3, 'public', '{}', \
+         '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        rusqlite::params![id, kind, owner_id],
+    )?;
+    Ok(())
+}
+
+#[test]
+fn corrupt_store_id_surfaces_typed_error() -> TestResult {
+    let model = fresh_model()?;
+
+    // Seed the only row: a root (owner_id NULL) whose id is not a valid UUID.
+    // A read via root() must interpret the corrupt id column and fail fast.
+    seed_element_row(&model, "not-a-valid-uuid", "Class", None)?;
+
+    let err = model.root().err();
+    ensure!(
+        matches!(err, Some(Error::CorruptStore { field, .. }) if field == "id"),
+        "corrupt id should surface as CorruptStore(id), got {err:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn corrupt_store_kind_surfaces_typed_error() -> TestResult {
+    let model = fresh_model()?;
+    let root = create_root(&model, "root")?;
+
+    // Seed a valid-id row whose kind is unknown (corruption), owned by root.
+    let bad_id = new_id();
+    seed_element_row(
+        &model,
+        &bad_id.as_uuid().to_string(),
+        "BogusKind",
+        Some(&root.as_uuid().to_string()),
+    )?;
+
+    // Reading it must fail fast with CorruptStore naming the kind field.
+    let err = model.get_element(bad_id).err();
+    ensure!(
+        matches!(err, Some(Error::CorruptStore { field, .. }) if field == "kind"),
+        "unknown kind should surface as CorruptStore(kind), got {err:?}"
+    );
+    Ok(())
+}
