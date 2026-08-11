@@ -61,7 +61,7 @@ pub trait Command: Send {
     ///
     /// Returns [`Error`] when the model API rejects the operation (invariant
     /// violation, store failure). Never panics (`REQ-ARCH-018`).
-    fn redo(&mut self, model: &Model) -> Result<(), Error>;
+    fn redo(&mut self, model: &mut Model) -> Result<(), Error>;
 
     /// Apply the inverse delta (re-played on undo).
     ///
@@ -70,7 +70,7 @@ pub trait Command: Send {
     /// Returns [`Error`] when replaying the inverse delta would violate an
     /// invariant (`REQ-PERS-016`). The command stays on the undo stack when
     /// this returns `Err`; the model is unchanged.
-    fn undo(&mut self, model: &Model) -> Result<(), Error>;
+    fn undo(&mut self, model: &mut Model) -> Result<(), Error>;
 
     /// A short, human-readable label (for UI/menus and MCP descriptions).
     fn label(&self) -> &'static str;
@@ -105,7 +105,7 @@ impl CreateElementCommand {
 }
 
 impl Command for CreateElementCommand {
-    fn redo(&mut self, model: &Model) -> Result<(), Error> {
+    fn redo(&mut self, model: &mut Model) -> Result<(), Error> {
         let view: ElementView = if self.req.owner.is_none() {
             model.create_root(self.req.id, self.req.name.clone())?
         } else {
@@ -115,7 +115,7 @@ impl Command for CreateElementCommand {
         Ok(())
     }
 
-    fn undo(&mut self, model: &Model) -> Result<(), Error> {
+    fn undo(&mut self, model: &mut Model) -> Result<(), Error> {
         model.delete_element(self.req.id)
     }
 
@@ -161,14 +161,14 @@ impl DeleteElementCommand {
 }
 
 impl Command for DeleteElementCommand {
-    fn redo(&mut self, model: &Model) -> Result<(), Error> {
+    fn redo(&mut self, model: &mut Model) -> Result<(), Error> {
         // Capture the element's state before deleting, so the undo delta can
         // re-create it with the same fields. This is the `undo` delta.
         self.snapshot = Some(model.get_element(self.id)?);
         model.delete_element(self.id)
     }
 
-    fn undo(&mut self, model: &Model) -> Result<(), Error> {
+    fn undo(&mut self, model: &mut Model) -> Result<(), Error> {
         let view = self.snapshot.clone().ok_or(Error::CannotUndoRedoBeforeDo {
             reason: "delete command has no snapshot; redo was never run",
         })?;
@@ -227,13 +227,13 @@ impl RenameElementCommand {
 }
 
 impl Command for RenameElementCommand {
-    fn redo(&mut self, model: &Model) -> Result<(), Error> {
+    fn redo(&mut self, model: &mut Model) -> Result<(), Error> {
         self.prior_name = model.get_element(self.id)?.name;
         model.rename_element(self.id, self.new_name.as_deref())?;
         Ok(())
     }
 
-    fn undo(&mut self, model: &Model) -> Result<(), Error> {
+    fn undo(&mut self, model: &mut Model) -> Result<(), Error> {
         let prior = self
             .prior_name
             .clone()
@@ -287,13 +287,13 @@ impl ReparentElementCommand {
 }
 
 impl Command for ReparentElementCommand {
-    fn redo(&mut self, model: &Model) -> Result<(), Error> {
+    fn redo(&mut self, model: &mut Model) -> Result<(), Error> {
         self.prior_owner = model.get_element(self.id)?.owner;
         model.reparent_element(self.id, self.new_owner)?;
         Ok(())
     }
 
-    fn undo(&mut self, model: &Model) -> Result<(), Error> {
+    fn undo(&mut self, model: &mut Model) -> Result<(), Error> {
         let prior = self.prior_owner;
         model.reparent_element(self.id, prior)?;
         Ok(())
@@ -334,7 +334,7 @@ impl CreateRelationshipCommand {
 }
 
 impl Command for CreateRelationshipCommand {
-    fn redo(&mut self, model: &Model) -> Result<(), Error> {
+    fn redo(&mut self, model: &mut Model) -> Result<(), Error> {
         let view: RelationshipView = model.create_relationship(&self.req)?;
         // Normalize the kind to the stored form in case the caller passed a
         // differently-cased string.
@@ -342,7 +342,7 @@ impl Command for CreateRelationshipCommand {
         Ok(())
     }
 
-    fn undo(&mut self, model: &Model) -> Result<(), Error> {
+    fn undo(&mut self, model: &mut Model) -> Result<(), Error> {
         model.delete_relationship(self.req.id)
     }
 
@@ -386,12 +386,12 @@ impl DeleteRelationshipCommand {
 }
 
 impl Command for DeleteRelationshipCommand {
-    fn redo(&mut self, model: &Model) -> Result<(), Error> {
+    fn redo(&mut self, model: &mut Model) -> Result<(), Error> {
         self.snapshot = Some(model.get_relationship(self.id)?);
         model.delete_relationship(self.id)
     }
 
-    fn undo(&mut self, model: &Model) -> Result<(), Error> {
+    fn undo(&mut self, model: &mut Model) -> Result<(), Error> {
         let view = self.snapshot.clone().ok_or(Error::CannotUndoRedoBeforeDo {
             reason: "delete-relationship command has no snapshot; redo was never run",
         })?;
@@ -438,7 +438,7 @@ impl BatchCommand {
 }
 
 impl Command for BatchCommand {
-    fn redo(&mut self, model: &Model) -> Result<(), Error> {
+    fn redo(&mut self, model: &mut Model) -> Result<(), Error> {
         // Apply each sub-command in order. If one fails, roll back the
         // already-applied ones (in reverse) so the batch is atomic.
         for i in 0..self.sub.len() {
@@ -463,7 +463,7 @@ impl Command for BatchCommand {
         Ok(())
     }
 
-    fn undo(&mut self, model: &Model) -> Result<(), Error> {
+    fn undo(&mut self, model: &mut Model) -> Result<(), Error> {
         // Undo each sub-command in reverse order. If one fails, the batch is
         // left partially undone — surface the error. (We do NOT roll forward
         // the remaining undone sub-commands, because that would re-apply
@@ -569,7 +569,7 @@ impl CommandStack {
     ///
     /// Returns [`Error`] when the command's `redo` fails (invariant violation,
     /// store failure). The command is NOT pushed onto the stack on failure.
-    pub fn execute(&mut self, model: &Model, mut cmd: Box<dyn Command>) -> Result<(), Error> {
+    pub fn execute(&mut self, model: &mut Model, mut cmd: Box<dyn Command>) -> Result<(), Error> {
         cmd.redo(model)?;
         // A new command after undos discards the redo branch.
         self.redo.clear();
@@ -591,7 +591,7 @@ impl CommandStack {
     ///
     /// Returns [`Error::UndoStackEmpty`] when the undo stack is empty, or the
     /// command's [`Error`] when replaying the inverse delta fails.
-    pub fn undo(&mut self, model: &Model) -> Result<(), Error> {
+    pub fn undo(&mut self, model: &mut Model) -> Result<(), Error> {
         let mut cmd = self.undo.pop().ok_or(Error::UndoStackEmpty)?;
         match cmd.undo(model) {
             Ok(()) => {
@@ -616,7 +616,7 @@ impl CommandStack {
     ///
     /// Returns [`Error::RedoStackEmpty`] when the redo stack is empty, or the
     /// command's [`Error`] when replaying the forward delta fails.
-    pub fn redo(&mut self, model: &Model) -> Result<(), Error> {
+    pub fn redo(&mut self, model: &mut Model) -> Result<(), Error> {
         let mut cmd = self.redo.pop().ok_or(Error::RedoStackEmpty)?;
         match cmd.redo(model) {
             Ok(()) => {

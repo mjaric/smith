@@ -68,14 +68,14 @@ fn new_id() -> ElementId {
 }
 
 /// Create the project root, returning its id.
-fn create_root(model: &Model, name: &str) -> Result<ElementId, Error> {
+fn create_root(model: &mut Model, name: &str) -> Result<ElementId, Error> {
     let id = new_id();
     model.create_root(id, Some(name.to_string()))?;
     Ok(id)
 }
 
 /// Create a package under `owner`.
-fn create_pkg(model: &Model, owner: ElementId, name: &str) -> Result<ElementId, Error> {
+fn create_pkg(model: &mut Model, owner: ElementId, name: &str) -> Result<ElementId, Error> {
     let id = new_id();
     model.create_element(&CreateElement {
         id,
@@ -88,7 +88,7 @@ fn create_pkg(model: &Model, owner: ElementId, name: &str) -> Result<ElementId, 
 }
 
 /// Create a class under `owner`.
-fn create_class(model: &Model, owner: ElementId, name: &str) -> Result<ElementId, Error> {
+fn create_class(model: &mut Model, owner: ElementId, name: &str) -> Result<ElementId, Error> {
     let id = new_id();
     model.create_element(&CreateElement {
         id,
@@ -107,19 +107,21 @@ fn create_class(model: &Model, owner: ElementId, name: &str) -> Result<ElementId
 
 #[test]
 fn owner_tree_is_acyclic_and_connected_after_mutations() -> TestResult {
-    let model = fresh_model()?;
-    let root = create_root(&model, "root")?;
-    let a = create_pkg(&model, root, "a")?;
-    let b = create_pkg(&model, a, "b")?;
-    let c = create_pkg(&model, b, "c")?;
+    let mut model = fresh_model()?;
+    let root = create_root(&mut model, "root")?;
+    let a = create_pkg(&mut model, root, "a")?;
+    let b = create_pkg(&mut model, a, "b")?;
+    let c = create_pkg(&mut model, b, "c")?;
 
     // After creating root -> a -> b -> c, every element is reachable from root.
-    let conn = model.connection();
-    let all_ids: BTreeSet<String> = conn
-        .prepare("SELECT id FROM elements")?
-        .query_map([], |r| r.get::<_, String>(0))?
-        .collect::<rusqlite::Result<BTreeSet<String>>>()?;
-    ensure_eq!(all_ids.len(), 4);
+    {
+        let conn = model.connection();
+        let all_ids: BTreeSet<String> = conn
+            .prepare("SELECT id FROM elements")?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<BTreeSet<String>>>()?;
+        ensure_eq!(all_ids.len(), 4);
+    }
 
     // Every element (except root) has exactly one owner; root has none.
     let root_view = model.get_element(root)?;
@@ -139,22 +141,25 @@ fn owner_tree_is_acyclic_and_connected_after_mutations() -> TestResult {
     ensure_eq!(c_view.owner, Some(b));
 
     // The tree is still connected: c's ancestors include root.
-    let c_ancestors = smith_store::closure::ancestors(conn, &c.as_uuid().to_string())?;
-    let ancestor_ids: BTreeSet<String> = c_ancestors.into_iter().map(|r| r.id).collect();
-    ensure!(
-        ancestor_ids.contains(&root.as_uuid().to_string()),
-        "root must be an ancestor of c after reparent"
-    );
+    {
+        let conn = model.connection();
+        let c_ancestors = smith_store::closure::ancestors(conn, &c.as_uuid().to_string())?;
+        let ancestor_ids: BTreeSet<String> = c_ancestors.into_iter().map(|r| r.id).collect();
+        ensure!(
+            ancestor_ids.contains(&root.as_uuid().to_string()),
+            "root must be an ancestor of c after reparent"
+        );
+    }
     Ok(())
 }
 
 #[test]
 fn reparent_into_own_subtree_is_rejected() -> TestResult {
-    let model = fresh_model()?;
-    let root = create_root(&model, "root")?;
-    let a = create_pkg(&model, root, "a")?;
-    let b = create_pkg(&model, a, "b")?;
-    let c = create_pkg(&model, b, "c")?;
+    let mut model = fresh_model()?;
+    let root = create_root(&mut model, "root")?;
+    let a = create_pkg(&mut model, root, "a")?;
+    let b = create_pkg(&mut model, a, "b")?;
+    let c = create_pkg(&mut model, b, "c")?;
 
     // Reparenting a into c (its own descendant) must be rejected.
     let err = model.reparent_element(a, Some(c));
@@ -193,10 +198,10 @@ fn reparent_into_own_subtree_is_rejected() -> TestResult {
 
 #[test]
 fn qualified_name_is_derived_never_stored() -> TestResult {
-    let model = fresh_model()?;
-    let root = create_root(&model, "root")?;
-    let a = create_pkg(&model, root, "a")?;
-    let b = create_class(&model, a, "b")?;
+    let mut model = fresh_model()?;
+    let root = create_root(&mut model, "root")?;
+    let a = create_pkg(&mut model, root, "a")?;
+    let b = create_class(&mut model, a, "b")?;
 
     // qualifiedName is derived from the ownership chain: root/a/b
     let qn = model.qualified_name(b)?;
@@ -232,16 +237,16 @@ fn qualified_name_is_derived_never_stored() -> TestResult {
 
 #[test]
 fn namespace_add_and_remove_set_and_unset_owner() -> TestResult {
-    let model = fresh_model()?;
-    let root = create_root(&model, "root")?;
-    let a = create_pkg(&model, root, "a")?;
+    let mut model = fresh_model()?;
+    let root = create_root(&mut model, "root")?;
+    let a = create_pkg(&mut model, root, "a")?;
 
     // Adding to a namespace sets owner.
     let a_view = model.get_element(a)?;
     ensure_eq!(a_view.owner, Some(root));
 
     // Create a class under a.
-    let cls = create_class(&model, a, "cls")?;
+    let cls = create_class(&mut model, a, "cls")?;
     let cls_view = model.get_element(cls)?;
     ensure_eq!(cls_view.owner, Some(a));
 
@@ -263,7 +268,7 @@ fn namespace_add_and_remove_set_and_unset_owner() -> TestResult {
 
 #[test]
 fn project_root_is_model_package_exactly_one() -> TestResult {
-    let model = fresh_model()?;
+    let mut model = fresh_model()?;
 
     // No root exists yet.
     ensure!(model.root()?.is_none(), "no root before create");
@@ -275,13 +280,15 @@ fn project_root_is_model_package_exactly_one() -> TestResult {
     ensure!(view.owner.is_none(), "root has no owner");
 
     // The data blob has isModel = true.
-    let conn = model.connection();
-    let data: String = conn.query_row(
-        "SELECT data FROM elements WHERE id = ?1",
-        rusqlite::params![root_id.as_uuid().to_string()],
-        |r| r.get(0),
-    )?;
-    ensure!(data.contains("\"isModel\":true"), "data must have isModel");
+    {
+        let conn = model.connection();
+        let data: String = conn.query_row(
+            "SELECT data FROM elements WHERE id = ?1",
+            rusqlite::params![root_id.as_uuid().to_string()],
+            |r| r.get(0),
+        )?;
+        ensure!(data.contains("\"isModel\":true"), "data must have isModel");
+    }
 
     // Exactly one root: creating a second is rejected.
     let second = new_id();
@@ -292,12 +299,15 @@ fn project_root_is_model_package_exactly_one() -> TestResult {
     );
 
     // Exactly one element with owner_id IS NULL.
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM elements WHERE owner_id IS NULL",
-        [],
-        |r| r.get(0),
-    )?;
-    ensure_eq!(count, 1);
+    {
+        let conn = model.connection();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM elements WHERE owner_id IS NULL",
+            [],
+            |r| r.get(0),
+        )?;
+        ensure_eq!(count, 1);
+    }
     Ok(())
 }
 
@@ -307,15 +317,15 @@ fn project_root_is_model_package_exactly_one() -> TestResult {
 
 #[test]
 fn packages_nest_to_arbitrary_depth() -> TestResult {
-    let model = fresh_model()?;
-    let root = create_root(&model, "root")?;
+    let mut model = fresh_model()?;
+    let root = create_root(&mut model, "root")?;
 
     // Nest packages 10 levels deep.
     let mut current = root;
     let mut names = vec!["root".to_string()];
     for i in 1..=10 {
         let name = format!("p{i}");
-        let pkg = create_pkg(&model, current, &name)?;
+        let pkg = create_pkg(&mut model, current, &name)?;
         current = pkg;
         names.push(name);
     }
@@ -345,9 +355,9 @@ fn packages_nest_to_arbitrary_depth() -> TestResult {
 
 #[test]
 fn comment_requires_body_and_dies_with_owner() -> TestResult {
-    let model = fresh_model()?;
-    let root = create_root(&model, "root")?;
-    let cls = create_class(&model, root, "cls")?;
+    let mut model = fresh_model()?;
+    let root = create_root(&mut model, "root")?;
+    let cls = create_class(&mut model, root, "cls")?;
 
     // Non-empty body is required.
     let cid = new_id();
@@ -382,9 +392,9 @@ fn comment_requires_body_and_dies_with_owner() -> TestResult {
 
 #[test]
 fn relationship_endpoints_must_exist() -> TestResult {
-    let model = fresh_model()?;
-    let root = create_root(&model, "root")?;
-    let a = create_class(&model, root, "a")?;
+    let mut model = fresh_model()?;
+    let root = create_root(&mut model, "root")?;
+    let a = create_class(&mut model, root, "a")?;
     let ghost = new_id(); // does not exist
 
     // Creating a relationship with a non-existent source is rejected.
@@ -438,10 +448,10 @@ fn relationship_endpoints_must_exist() -> TestResult {
 
 #[test]
 fn qualified_name_derivation_terminates() -> TestResult {
-    let model = fresh_model()?;
-    let root = create_root(&model, "root")?;
-    let a = create_pkg(&model, root, "a")?;
-    let b = create_pkg(&model, a, "b")?;
+    let mut model = fresh_model()?;
+    let root = create_root(&mut model, "root")?;
+    let a = create_pkg(&mut model, root, "a")?;
+    let b = create_pkg(&mut model, a, "b")?;
 
     // qualifiedName derivation walks up the ownership chain and terminates.
     let qn = model.qualified_name(b)?;
@@ -473,9 +483,9 @@ fn mutation_is_durable_in_sqlite_after_commit() -> TestResult {
     let root_id;
     let cls_id;
     {
-        let model = Model::open(&path)?;
-        root_id = create_root(&model, "root")?;
-        cls_id = create_class(&model, root_id, "cls")?;
+        let mut model = Model::open(&path)?;
+        root_id = create_root(&mut model, "root")?;
+        cls_id = create_class(&mut model, root_id, "cls")?;
     } // model dropped → store checkpointed
 
     // Reopen: the data must be durable.
@@ -503,8 +513,8 @@ fn mutation_is_durable_in_sqlite_after_commit() -> TestResult {
 
 #[test]
 fn model_holds_single_write_connection() -> TestResult {
-    let model = fresh_model()?;
-    let root = create_root(&model, "root")?;
+    let mut model = fresh_model()?;
+    let root = create_root(&mut model, "root")?;
 
     // The model exposes exactly one connection reference. All mutations and
     // reads go through it (REQ-PERS-012: single write connection).
@@ -524,7 +534,7 @@ fn model_holds_single_write_connection() -> TestResult {
     ensure_eq!(count, 1);
 
     // And a write works through it (create another element).
-    let a = create_pkg(&model, root, "a")?;
+    let a = create_pkg(&mut model, root, "a")?;
     let a_view = model.get_element(a)?;
     ensure_eq!(a_view.owner, Some(root));
     Ok(())
@@ -536,10 +546,10 @@ fn model_holds_single_write_connection() -> TestResult {
 
 #[test]
 fn failed_transaction_leaves_store_and_state_unchanged() -> TestResult {
-    let model = fresh_model()?;
-    let root = create_root(&model, "root")?;
-    let a = create_pkg(&model, root, "a")?;
-    let b = create_class(&model, a, "b")?;
+    let mut model = fresh_model()?;
+    let root = create_root(&mut model, "root")?;
+    let a = create_pkg(&mut model, root, "a")?;
+    let b = create_class(&mut model, a, "b")?;
 
     // Attempt a reparent that would form a cycle (a into b, its own descendant).
     // This must fail and leave the store unchanged.
@@ -555,13 +565,15 @@ fn failed_transaction_leaves_store_and_state_unchanged() -> TestResult {
     ensure_eq!(b_view.owner, Some(a));
 
     // The closure table is also unchanged: a's ancestors are [a, root].
-    let conn = model.connection();
-    let a_ancestors = smith_store::closure::ancestors(conn, &a.as_uuid().to_string())?;
-    let ancestor_ids: Vec<String> = a_ancestors.into_iter().map(|r| r.id).collect();
-    ensure_eq!(
-        ancestor_ids,
-        vec![a.as_uuid().to_string(), root.as_uuid().to_string()]
-    );
+    {
+        let conn = model.connection();
+        let a_ancestors = smith_store::closure::ancestors(conn, &a.as_uuid().to_string())?;
+        let ancestor_ids: Vec<String> = a_ancestors.into_iter().map(|r| r.id).collect();
+        ensure_eq!(
+            ancestor_ids,
+            vec![a.as_uuid().to_string(), root.as_uuid().to_string()]
+        );
+    }
 
     // Attempt to create a relationship referencing a non-existent element.
     // This fails before the transaction starts, so the store is untouched.
@@ -576,12 +588,16 @@ fn failed_transaction_leaves_store_and_state_unchanged() -> TestResult {
         })
         .err()
         .ok_or("expected error")?;
-    let rel_count: i64 = conn.query_row("SELECT COUNT(*) FROM relationships", [], |r| r.get(0))?;
-    ensure_eq!(
-        rel_count,
-        0,
-        "no relationship should exist after failed create"
-    );
+    {
+        let conn = model.connection();
+        let rel_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM relationships", [], |r| r.get(0))?;
+        ensure_eq!(
+            rel_count,
+            0,
+            "no relationship should exist after failed create"
+        );
+    }
     Ok(())
 }
 
@@ -592,10 +608,10 @@ fn failed_transaction_leaves_store_and_state_unchanged() -> TestResult {
 
 #[test]
 fn delete_element_referenced_by_relationship_is_rejected() -> TestResult {
-    let model = fresh_model()?;
-    let root = create_root(&model, "root")?;
-    let a = create_class(&model, root, "a")?;
-    let b = create_class(&model, root, "b")?;
+    let mut model = fresh_model()?;
+    let root = create_root(&mut model, "root")?;
+    let a = create_class(&mut model, root, "a")?;
+    let b = create_class(&mut model, root, "b")?;
 
     // Create a relationship a -> b.
     let rid = new_id();
@@ -641,10 +657,10 @@ fn delete_element_referenced_by_relationship_is_rejected() -> TestResult {
 
 #[test]
 fn delete_element_with_children_is_rejected() -> TestResult {
-    let model = fresh_model()?;
-    let root = create_root(&model, "root")?;
-    let a = create_pkg(&model, root, "a")?;
-    let b = create_class(&model, a, "b")?;
+    let mut model = fresh_model()?;
+    let root = create_root(&mut model, "root")?;
+    let a = create_pkg(&mut model, root, "a")?;
+    let b = create_class(&mut model, a, "b")?;
 
     // Deleting a (which owns b) must be rejected.
     let err = model.delete_element(a).err();
@@ -672,7 +688,7 @@ fn create_root_sets_is_model_in_a_single_transaction() -> TestResult {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    let model = fresh_model()?;
+    let mut model = fresh_model()?;
 
     // Count commits on the single write connection. create_root must commit
     // exactly once: the element row (with isModel already in its data blob)
@@ -722,10 +738,10 @@ fn create_root_sets_is_model_in_a_single_transaction() -> TestResult {
 
 #[test]
 fn delete_element_owned_by_relationship_is_rejected() -> TestResult {
-    let model = fresh_model()?;
-    let root = create_root(&model, "root")?;
-    let pkg = create_pkg(&model, root, "pkg")?;
-    let cls = create_class(&model, root, "cls")?;
+    let mut model = fresh_model()?;
+    let root = create_root(&mut model, "root")?;
+    let pkg = create_pkg(&mut model, root, "pkg")?;
+    let cls = create_class(&mut model, root, "cls")?;
 
     // A self-loop relationship on cls, owned by pkg. Deleting pkg is blocked
     // by relationships.owner_id (neither source_id nor target_id matches pkg).
@@ -794,8 +810,8 @@ fn corrupt_store_id_surfaces_typed_error() -> TestResult {
 
 #[test]
 fn corrupt_store_kind_surfaces_typed_error() -> TestResult {
-    let model = fresh_model()?;
-    let root = create_root(&model, "root")?;
+    let mut model = fresh_model()?;
+    let root = create_root(&mut model, "root")?;
 
     // Seed a valid-id row whose kind is unknown (corruption), owned by root.
     let bad_id = new_id();

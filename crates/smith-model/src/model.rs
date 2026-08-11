@@ -20,10 +20,14 @@ use crate::error::Error;
 ///
 /// Created from a path via [`Model::open`]. Mutations go through the single
 /// write connection (`REQ-PERS-012`) and commit in one transaction
-/// (`REQ-PERS-013`). Reads query the live connection directly.
+/// (`REQ-PERS-013`). Reads query the live connection directly. The in-memory
+/// petgraph projection ([`crate::projection::Projection`]) hydrates on open and
+/// is updated write-through after every successful commit — they update
+/// together or not at all (`REQ-ARCH-007`).
 #[derive(Debug)]
 pub struct Model {
     store: smith_store::Store,
+    projection: crate::projection::Projection,
 }
 
 /// A snapshot of an element row, for reads (`REQ-PERS-001`).
@@ -105,19 +109,23 @@ const NOW: &str = "2026-01-01T00:00:00Z";
 impl Model {
     /// Open (or create) a `.smith` project file.
     ///
-    /// Wraps [`smith_store::open`] and surfaces store errors as
-    /// [`Error::Store`].
+    /// Wraps [`smith_store::open`] and hydrates the in-memory petgraph
+    /// projection from `SQLite` (`REQ-PERS-002`). Store errors surface as
+    /// [`Error::Store`]; corrupt rows surface as [`Error::CorruptStore`].
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Store`] when the underlying file cannot be opened or
-    /// migrated.
+    /// - [`Error::Store`] when the underlying file cannot be opened or
+    ///   migrated.
+    /// - [`Error::CorruptStore`] when a row holds an unparseable id or
+    ///   unknown kind during hydration.
     pub fn open(path: &Path) -> Result<Self, Error> {
         let store = smith_store::open(path).map_err(|detail| Error::Store {
             path: path.to_path_buf(),
             detail,
         })?;
-        Ok(Self { store })
+        let projection = crate::projection::Projection::hydrate(store.connection())?;
+        Ok(Self { store, projection })
     }
 
     /// The live `SQLite` connection (single writer; `REQ-PERS-012`).
@@ -132,6 +140,30 @@ impl Model {
         self.store.schema_version()
     }
 
+    /// The in-memory petgraph projection (`REQ-PERS-002`).
+    ///
+    /// The projection is a rebuildable cache; `SQLite` is the source of truth.
+    /// Updated write-through after every successful mutation commit.
+    #[must_use]
+    pub fn projection(&self) -> &crate::projection::Projection {
+        &self.projection
+    }
+
+    /// Rebuild the projection from `SQLite` (`REQ-PERS-002`).
+    ///
+    /// Discards the current graph state and re-hydrates from the store. `SQLite`
+    /// wins on divergence. No projection-derived state survives a rebuild
+    /// (`REQ-PERS-003`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Sqlite`] on store failure, or [`Error::CorruptStore`]
+    /// when a row holds an unparseable id or unknown kind.
+    pub fn rebuild_projection(&mut self) -> Result<(), Error> {
+        let conn = self.store.connection();
+        self.projection.rebuild(conn)
+    }
+
     // --- project root -------------------------------------------------------
 
     /// Create the project root: a `Package` with `isModel = true`, no owner
@@ -144,7 +176,11 @@ impl Model {
     ///
     /// - [`Error::RootAlreadyExists`] when a root already exists.
     /// - [`Error::Store`] / [`Error::Sqlite`] on store failure.
-    pub fn create_root(&self, id: ElementId, name: Option<String>) -> Result<ElementView, Error> {
+    pub fn create_root(
+        &mut self,
+        id: ElementId,
+        name: Option<String>,
+    ) -> Result<ElementView, Error> {
         if let Some(existing) = self.root_id()? {
             return Err(Error::RootAlreadyExists { existing });
         }
@@ -164,7 +200,12 @@ impl Model {
         insert_element_row(&tx, &req, r#"{"isModel":true}"#)?;
         closure::insert_on_create(&tx, &req.id.as_uuid().to_string(), None)?;
         tx.commit()?;
-        self.get_element(req.id)
+        // Write-through: the transaction committed, so update the projection.
+        // If this had failed, neither the store nor the projection would have
+        // changed (they update together or not at all — REQ-ARCH-007).
+        let view = self.get_element(req.id)?;
+        self.projection.add_element(&view);
+        Ok(view)
     }
 
     /// The project root element, if one exists (`REQ-MM-006`).
@@ -212,7 +253,7 @@ impl Model {
     /// - [`Error::ElementNotFound`] when the owner does not exist.
     /// - [`Error::RootAlreadyExists`] when creating a second root.
     /// - [`Error::Sqlite`] on store failure.
-    pub fn create_element(&self, req: &CreateElement) -> Result<ElementView, Error> {
+    pub fn create_element(&mut self, req: &CreateElement) -> Result<ElementView, Error> {
         if req.kind.scope() != MetaclassScope::TopLevel {
             return Err(Error::NotTopLevelKind {
                 kind: req.kind.as_str().to_string(),
@@ -238,7 +279,10 @@ impl Model {
             req.owner.map(|o| o.as_uuid().to_string()).as_deref(),
         )?;
         tx.commit()?;
-        self.get_element(req.id)
+        // Write-through: the transaction committed, so update the projection.
+        let view = self.get_element(req.id)?;
+        self.projection.add_element(&view);
+        Ok(view)
     }
 
     /// Get an element by id (`REQ-PERS-001`).
@@ -269,7 +313,11 @@ impl Model {
     /// # Errors
     ///
     /// Returns [`Error::ElementNotFound`] or [`Error::Sqlite`].
-    pub fn rename_element(&self, id: ElementId, name: Option<&str>) -> Result<ElementView, Error> {
+    pub fn rename_element(
+        &mut self,
+        id: ElementId,
+        name: Option<&str>,
+    ) -> Result<ElementView, Error> {
         let conn = self.connection();
         let tx = conn.unchecked_transaction()?;
         let changed = tx.execute(
@@ -280,6 +328,8 @@ impl Model {
             return Err(Error::ElementNotFound { id });
         }
         tx.commit()?;
+        // Write-through: update the projection node's name.
+        self.projection.rename_element(id, name);
         self.get_element(id)
     }
 
@@ -300,7 +350,7 @@ impl Model {
     ///   element's subtree.
     /// - [`Error::Sqlite`] on store failure.
     pub fn reparent_element(
-        &self,
+        &mut self,
         id: ElementId,
         new_owner: Option<ElementId>,
     ) -> Result<ElementView, Error> {
@@ -337,6 +387,8 @@ impl Model {
             new_owner.map(|o| o.as_uuid().to_string()).as_deref(),
         )?;
         tx.commit()?;
+        // Write-through: update the projection's ownership edges.
+        self.projection.reparent_element(id, new_owner);
         self.get_element(id)
     }
 
@@ -358,7 +410,7 @@ impl Model {
     /// - [`Error::ElementReferencedByRelationship`] when a relationship
     ///   references it.
     /// - [`Error::Sqlite`] on store failure.
-    pub fn delete_element(&self, id: ElementId) -> Result<(), Error> {
+    pub fn delete_element(&mut self, id: ElementId) -> Result<(), Error> {
         let id_str = id.as_uuid().to_string();
         if !self.element_exists(id)? {
             return Err(Error::ElementNotFound { id });
@@ -399,6 +451,8 @@ impl Model {
         let tx = conn.unchecked_transaction()?;
         tx.execute("DELETE FROM elements WHERE id = ?1", params![id_str])?;
         tx.commit()?;
+        // Write-through: remove the node and all its edges from the projection.
+        self.projection.remove_element(id);
         Ok(())
     }
 
@@ -412,7 +466,10 @@ impl Model {
     ///   not exist.
     /// - [`Error::ElementNotFound`] when the owner does not exist.
     /// - [`Error::Sqlite`] on store failure.
-    pub fn create_relationship(&self, req: &CreateRelationship) -> Result<RelationshipView, Error> {
+    pub fn create_relationship(
+        &mut self,
+        req: &CreateRelationship,
+    ) -> Result<RelationshipView, Error> {
         if !self.element_exists(req.source)? {
             return Err(Error::RelationshipEndpointNotFound {
                 kind: req.kind.clone(),
@@ -443,7 +500,10 @@ impl Model {
             ],
         )?;
         tx.commit()?;
-        self.get_relationship(req.id)
+        // Write-through: add the relationship edge to the projection.
+        let view = self.get_relationship(req.id)?;
+        self.projection.add_relationship(&view);
+        Ok(view)
     }
 
     /// Get a relationship by id.
@@ -486,7 +546,7 @@ impl Model {
     /// # Errors
     ///
     /// Returns [`Error::RelationshipNotFound`] or [`Error::Sqlite`].
-    pub fn delete_relationship(&self, id: ElementId) -> Result<(), Error> {
+    pub fn delete_relationship(&mut self, id: ElementId) -> Result<(), Error> {
         let conn = self.connection();
         let tx = conn.unchecked_transaction()?;
         let changed = tx.execute(
@@ -497,6 +557,8 @@ impl Model {
             return Err(Error::RelationshipNotFound { id });
         }
         tx.commit()?;
+        // Write-through: remove the relationship edge from the projection.
+        self.projection.remove_relationship(id);
         Ok(())
     }
 
@@ -513,7 +575,7 @@ impl Model {
     /// - [`Error::ElementNotFound`] when the owner does not exist.
     /// - [`Error::Sqlite`] on store failure.
     pub fn create_comment(
-        &self,
+        &mut self,
         id: ElementId,
         owner: ElementId,
         body: impl Into<String>,
@@ -666,7 +728,7 @@ fn comment_err(err: &CommentError) -> Error {
 /// UUID — a corrupt id in the store is a data-integrity failure that must be
 /// surfaced, never silently substituted with a fresh random id
 /// (`REQ-ARCH-017`/`REQ-ARCH-018`).
-fn parse_id(s: &str) -> Result<ElementId, Error> {
+pub(crate) fn parse_id(s: &str) -> Result<ElementId, Error> {
     uuid::Uuid::parse_str(s)
         .map(ElementId::from)
         .map_err(|_| Error::CorruptStore {
@@ -679,7 +741,7 @@ fn parse_id(s: &str) -> Result<ElementId, Error> {
 ///
 /// Fails fast with [`Error::CorruptStore`] when the kind is unknown — an
 /// unrecognized kind is corruption, not a defaultable `Package`.
-fn kind_from_store(s: &str) -> Result<MetaclassKind, Error> {
+pub(crate) fn kind_from_store(s: &str) -> Result<MetaclassKind, Error> {
     MetaclassKind::from_id(s).ok_or(Error::CorruptStore {
         field: "kind",
         detail: format!("unknown metaclass kind: {s:?}"),
