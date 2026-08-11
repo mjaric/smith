@@ -1,0 +1,22 @@
+[package]
+name = "smith-model"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+description = "The Smith model API: CRUD over elements and relationships, ownership-tree invariants, single-transaction persistence through smith-store"
+
+[dependencies]
+smith-core = { path = "../smith-core" }
+smith-store = { path = "../smith-store" }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+rusqlite = { workspace = true, features = ["hooks"] }
+
+[lints]
+workspace = true
