@@ -1,0 +1,679 @@
+//! The model API: CRUD over elements and relationships, with ownership-tree
+//! invariants enforced (`REQ-MM-002`…`007`, `INV-MM-001/004/005`).
+//!
+//! [`Model`] wraps a [`smith_store::Store`] and holds the single write
+//! connection (`REQ-PERS-012`). Every mutation runs in one `SQLite` transaction
+//! (`REQ-PERS-013`): the element/relationship row and the closure rows commit
+//! together, or neither does — on failure neither the projection nor the store
+//! changes. All fallible operations return [`Result`]; no panic crosses the
+//! boundary (`REQ-ARCH-017`, `REQ-ARCH-018`).
+
+use std::path::Path;
+
+use rusqlite::{params, Connection, OptionalExtension};
+use smith_core::{
+    Comment, CommentError, ElementId, MetaclassKind, MetaclassScope, Visibility,
+};
+use smith_store::closure;
+
+use crate::error::Error;
+
+/// The `.smith` project model: a store plus the model API (`REQ-PERS-001`).
+///
+/// Created from a path via [`Model::open`]. Mutations go through the single
+/// write connection (`REQ-PERS-012`) and commit in one transaction
+/// (`REQ-PERS-013`). Reads query the live connection directly.
+#[derive(Debug)]
+pub struct Model {
+    store: smith_store::Store,
+}
+
+/// A snapshot of an element row, for reads (`REQ-PERS-001`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElementView {
+    /// Immutable identity.
+    pub id: ElementId,
+    /// Metaclass kind.
+    pub kind: MetaclassKind,
+    /// Owning namespace id (`None` only for the project root).
+    pub owner: Option<ElementId>,
+    /// Human-readable name (optional, not unique).
+    pub name: Option<String>,
+    /// UML visibility.
+    pub visibility: Visibility,
+}
+
+/// A snapshot of a relationship row, for reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationshipView {
+    /// Edge identity.
+    pub id: ElementId,
+    /// Relationship kind string.
+    pub kind: String,
+    /// Source element id.
+    pub source: ElementId,
+    /// Target element id.
+    pub target: ElementId,
+    /// Owning namespace id.
+    pub owner: ElementId,
+}
+
+/// A snapshot of a comment row, for reads (`REQ-MM-011`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommentView {
+    /// Comment identity.
+    pub id: ElementId,
+    /// Owning element id.
+    pub owner: ElementId,
+    /// Non-empty comment body.
+    pub body: String,
+}
+
+/// A request to create an element (the kind-agnostic common fields).
+#[derive(Debug, Clone)]
+pub struct CreateElement {
+    /// Fresh identity minted by the caller.
+    pub id: ElementId,
+    /// Metaclass (must be a top-level ownable kind).
+    pub kind: MetaclassKind,
+    /// Optional name.
+    pub name: Option<String>,
+    /// Owning namespace (`None` only for the project root).
+    pub owner: Option<ElementId>,
+    /// UML visibility (defaults to public).
+    pub visibility: Visibility,
+}
+
+/// A request to create a relationship.
+#[derive(Debug, Clone)]
+pub struct CreateRelationship {
+    /// Fresh identity minted by the caller.
+    pub id: ElementId,
+    /// Relationship kind string (e.g. `"Association"`, `"Generalization"`).
+    pub kind: String,
+    /// Source element (must exist).
+    pub source: ElementId,
+    /// Target element (must exist).
+    pub target: ElementId,
+    /// Owning namespace (must exist).
+    pub owner: ElementId,
+}
+
+/// RFC 3339 timestamp used for `created_at`/`updated_at`.
+///
+/// A fixed value keeps tests deterministic; a real clock would inject here.
+const NOW: &str = "2026-01-01T00:00:00Z";
+
+impl Model {
+    /// Open (or create) a `.smith` project file.
+    ///
+    /// Wraps [`smith_store::open`] and surfaces store errors as
+    /// [`Error::Store`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Store`] when the underlying file cannot be opened or
+    /// migrated.
+    pub fn open(path: &Path) -> Result<Self, Error> {
+        let store = smith_store::open(path).map_err(|detail| Error::Store {
+            path: path.to_path_buf(),
+            detail,
+        })?;
+        Ok(Self { store })
+    }
+
+    /// The live `SQLite` connection (single writer; `REQ-PERS-012`).
+    #[must_use]
+    pub fn connection(&self) -> &Connection {
+        self.store.connection()
+    }
+
+    /// The schema version this file was migrated to on open.
+    #[must_use]
+    pub fn schema_version(&self) -> u32 {
+        self.store.schema_version()
+    }
+
+    // --- project root -------------------------------------------------------
+
+    /// Create the project root: a `Package` with `isModel = true`, no owner
+    /// (`REQ-MM-006`). Exactly one per project; a second is rejected.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::RootAlreadyExists`] when a root already exists.
+    /// - [`Error::Store`] / [`Error::Sqlite`] on store failure.
+    pub fn create_root(&self, id: ElementId, name: Option<String>) -> Result<ElementView, Error> {
+        if self.root_id()?.is_some() {
+            // Fetch the existing root id for the error.
+            let conn = self.connection();
+            let existing: String = conn
+                .query_row(
+                    "SELECT id FROM elements WHERE owner_id IS NULL LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or(Error::RootAlreadyExists {
+                    existing: ElementId::new(),
+                })?;
+            return Err(Error::RootAlreadyExists {
+                existing: parse_id(&existing),
+            });
+        }
+        let req = CreateElement {
+            id,
+            kind: MetaclassKind::Package,
+            name,
+            owner: None,
+            visibility: Visibility::Public,
+        };
+        let view = self.create_element(&req)?;
+        // Mark isModel in the data blob.
+        let conn = self.connection();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE elements SET data = ?1 WHERE id = ?2",
+            params![r#"{"isModel":true}"#, id.as_uuid().to_string()],
+        )?;
+        tx.commit()?;
+        Ok(view)
+    }
+
+    /// The project root element, if one exists (`REQ-MM-006`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Sqlite`] on store failure.
+    pub fn root(&self) -> Result<Option<ElementView>, Error> {
+        let conn = self.connection();
+        let row = conn
+            .query_row(
+                "SELECT id, kind, owner_id, name, visibility \
+                 FROM elements WHERE owner_id IS NULL LIMIT 1",
+                [],
+                row_to_element_view,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    fn root_id(&self) -> Result<Option<ElementId>, Error> {
+        let conn = self.connection();
+        let id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM elements WHERE owner_id IS NULL LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(id.as_deref().map(parse_id))
+    }
+
+    // --- element CRUD -------------------------------------------------------
+
+    /// Create an element (`REQ-MM-005`: adding to a namespace sets `owner`).
+    ///
+    /// The element row and closure rows commit in one transaction
+    /// (`REQ-PERS-013`). The kind must be a top-level ownable metaclass
+    /// (`REQ-MM-015`).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::NotTopLevelKind`] when the kind is a sub-element kind.
+    /// - [`Error::ElementNotFound`] when the owner does not exist.
+    /// - [`Error::RootAlreadyExists`] when creating a second root.
+    /// - [`Error::Sqlite`] on store failure.
+    pub fn create_element(&self, req: &CreateElement) -> Result<ElementView, Error> {
+        if req.kind.scope() != MetaclassScope::TopLevel {
+            return Err(Error::NotTopLevelKind {
+                kind: req.kind.as_str().to_string(),
+            });
+        }
+        if req.owner.is_none() && self.root_id()?.is_some() {
+            return Err(Error::RootAlreadyExists {
+                existing: self.root_id()?.unwrap_or(ElementId::new()),
+            });
+        }
+        // Validate the owner exists (if given).
+        if let Some(owner) = req.owner {
+            if !self.element_exists(owner)? {
+                return Err(Error::ElementNotFound { id: owner });
+            }
+        }
+        let conn = self.connection();
+        let tx = conn.unchecked_transaction()?;
+        insert_element_row(&tx, req)?;
+        closure::insert_on_create(
+            &tx,
+            &req.id.as_uuid().to_string(),
+            req.owner.map(|o| o.as_uuid().to_string()).as_deref(),
+        )?;
+        tx.commit()?;
+        self.get_element(req.id)
+    }
+
+    /// Get an element by id (`REQ-PERS-001`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ElementNotFound`] when no element has this id, or
+    /// [`Error::Sqlite`] on store failure.
+    pub fn get_element(&self, id: ElementId) -> Result<ElementView, Error> {
+        let conn = self.connection();
+        let row = conn
+            .query_row(
+                "SELECT id, kind, owner_id, name, visibility FROM elements WHERE id = ?1",
+                params![id.as_uuid().to_string()],
+                row_to_element_view,
+            )
+            .optional()?;
+        row.ok_or(Error::ElementNotFound { id })
+    }
+
+    /// Rename an element (`name` is mutable, not unique; `REQ-MM-004`).
+    /// Renaming updates `qualifiedName` transparently (it is derived, not
+    /// stored — `REQ-MM-003`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ElementNotFound`] or [`Error::Sqlite`].
+    pub fn rename_element(&self, id: ElementId, name: Option<&str>) -> Result<ElementView, Error> {
+        let conn = self.connection();
+        let tx = conn.unchecked_transaction()?;
+        let changed = tx.execute(
+            "UPDATE elements SET name = ?1, updated_at = ?2 WHERE id = ?3",
+            params![name, NOW, id.as_uuid().to_string()],
+        )?;
+        if changed == 0 {
+            return Err(Error::ElementNotFound { id });
+        }
+        tx.commit()?;
+        self.get_element(id)
+    }
+
+    /// Reparent an element (`REQ-MM-005`: sets the new `owner`).
+    ///
+    /// Reparenting into the element's own subtree is rejected to keep the
+    /// ownership tree acyclic (`INV-MM-001`). The closure table is updated
+    /// in the same transaction (`REQ-PERS-008`).
+    ///
+    /// Pass `new_owner = None` to orphan to root (only valid if the element
+    /// is not already the project root — the root has no owner).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::ElementNotFound`] when the element or new owner does not
+    ///   exist.
+    /// - [`Error::ReparentIntoOwnSubtree`] when the new owner is in the
+    ///   element's subtree.
+    /// - [`Error::Sqlite`] on store failure.
+    pub fn reparent_element(
+        &self,
+        id: ElementId,
+        new_owner: Option<ElementId>,
+    ) -> Result<ElementView, Error> {
+        let id_str = id.as_uuid().to_string();
+        // Validate the element exists.
+        if !self.element_exists(id)? {
+            return Err(Error::ElementNotFound { id });
+        }
+        // Validate the new owner exists and is not in the element's subtree.
+        if let Some(owner) = new_owner {
+            if !self.element_exists(owner)? {
+                return Err(Error::ElementNotFound { id: owner });
+            }
+            let owner_str = owner.as_uuid().to_string();
+            let conn = self.connection();
+            // If the new owner is a descendant of (or equal to) the element,
+            // reparenting would form a cycle (INV-MM-001).
+            if closure::depth(conn, &id_str, &owner_str)?.is_some() {
+                return Err(Error::ReparentIntoOwnSubtree {
+                    element: id,
+                    new_owner: owner,
+                });
+            }
+        }
+        let conn = self.connection();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE elements SET owner_id = ?1, updated_at = ?2 WHERE id = ?3",
+            params![
+                new_owner.map(|o| o.as_uuid().to_string()),
+                NOW,
+                id_str,
+            ],
+        )?;
+        closure::update_on_reparent(
+            &tx,
+            &id_str,
+            new_owner.map(|o| o.as_uuid().to_string()).as_deref(),
+        )?;
+        tx.commit()?;
+        self.get_element(id)
+    }
+
+    /// Delete an element (`REQ-MM-005`: removing from a namespace unsets
+    /// `owner`).
+    ///
+    /// Deleting an element that owns children is rejected
+    /// (store-level `ON DELETE RESTRICT` on `elements.owner_id`). Deleting
+    /// an element referenced by a relationship is rejected (store-level
+    /// `ON DELETE RESTRICT` on `relationships.source_id`/`target_id`). The
+    /// closure table is cleaned by `ON DELETE CASCADE`.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::ElementNotFound`] when the element does not exist.
+    /// - [`Error::ElementHasChildren`] when the element owns children.
+    /// - [`Error::ElementReferencedByRelationship`] when a relationship
+    ///   references it.
+    /// - [`Error::Sqlite`] on store failure.
+    pub fn delete_element(&self, id: ElementId) -> Result<(), Error> {
+        let id_str = id.as_uuid().to_string();
+        if !self.element_exists(id)? {
+            return Err(Error::ElementNotFound { id });
+        }
+        let conn = self.connection();
+        // Pre-check children (ON DELETE RESTRICT on owner_id).
+        let child_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM elements WHERE owner_id = ?1",
+            params![id_str],
+            |row| row.get(0),
+        )?;
+        if child_count > 0 {
+            return Err(Error::ElementHasChildren {
+                element: id,
+                count: usize::try_from(child_count).unwrap_or(0),
+            });
+        }
+        // Pre-check relationship references (ON DELETE RESTRICT).
+        let rel_ref: Option<String> = conn
+            .query_row(
+                "SELECT id FROM relationships WHERE source_id = ?1 OR target_id = ?1 LIMIT 1",
+                params![id_str],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(rel_id) = rel_ref {
+            return Err(Error::ElementReferencedByRelationship {
+                element: id,
+                relationship: parse_id(&rel_id),
+            });
+        }
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM elements WHERE id = ?1", params![id_str])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    // --- relationship CRUD --------------------------------------------------
+
+    /// Create a relationship (`INV-MM-004`: endpoints must exist).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::RelationshipEndpointNotFound`] when source or target does
+    ///   not exist.
+    /// - [`Error::ElementNotFound`] when the owner does not exist.
+    /// - [`Error::Sqlite`] on store failure.
+    pub fn create_relationship(&self, req: &CreateRelationship) -> Result<RelationshipView, Error> {
+        if !self.element_exists(req.source)? {
+            return Err(Error::RelationshipEndpointNotFound {
+                kind: req.kind.clone(),
+                endpoint: req.source,
+            });
+        }
+        if !self.element_exists(req.target)? {
+            return Err(Error::RelationshipEndpointNotFound {
+                kind: req.kind.clone(),
+                endpoint: req.target,
+            });
+        }
+        if !self.element_exists(req.owner)? {
+            return Err(Error::ElementNotFound { id: req.owner });
+        }
+        let conn = self.connection();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO relationships (id, kind, source_id, target_id, owner_id, data, \
+             created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, '{}', ?6, ?6)",
+            params![
+                req.id.as_uuid().to_string(),
+                &req.kind,
+                req.source.as_uuid().to_string(),
+                req.target.as_uuid().to_string(),
+                req.owner.as_uuid().to_string(),
+                NOW,
+            ],
+        )?;
+        tx.commit()?;
+        self.get_relationship(req.id)
+    }
+
+    /// Get a relationship by id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::RelationshipNotFound`] or [`Error::Sqlite`].
+    pub fn get_relationship(&self, id: ElementId) -> Result<RelationshipView, Error> {
+        let conn = self.connection();
+        let row = conn
+            .query_row(
+                "SELECT id, kind, source_id, target_id, owner_id FROM relationships WHERE id = ?1",
+                params![id.as_uuid().to_string()],
+                |row| {
+                    Ok(RelationshipView {
+                        id: parse_id(&row.get::<_, String>(0)?),
+                        kind: row.get(1)?,
+                        source: parse_id(&row.get::<_, String>(2)?),
+                        target: parse_id(&row.get::<_, String>(3)?),
+                        owner: parse_id(&row.get::<_, String>(4)?),
+                    })
+                },
+            )
+            .optional()?;
+        row.ok_or(Error::RelationshipNotFound { id })
+    }
+
+    /// Delete a relationship.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::RelationshipNotFound`] or [`Error::Sqlite`].
+    pub fn delete_relationship(&self, id: ElementId) -> Result<(), Error> {
+        let conn = self.connection();
+        let tx = conn.unchecked_transaction()?;
+        let changed = tx.execute(
+            "DELETE FROM relationships WHERE id = ?1",
+            params![id.as_uuid().to_string()],
+        )?;
+        if changed == 0 {
+            return Err(Error::RelationshipNotFound { id });
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    // --- comments -----------------------------------------------------------
+
+    /// Create a comment on an element (`REQ-MM-011`: non-empty body).
+    ///
+    /// Deleting the owning element deletes the comment (store-level
+    /// `ON DELETE CASCADE` on `comments.owner_id`).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::EmptyCommentBody`] when the body is empty.
+    /// - [`Error::ElementNotFound`] when the owner does not exist.
+    /// - [`Error::Sqlite`] on store failure.
+    pub fn create_comment(
+        &self,
+        id: ElementId,
+        owner: ElementId,
+        body: impl Into<String>,
+    ) -> Result<CommentView, Error> {
+        let comment = Comment::new(body).map_err(|e| comment_err(&e))?;
+        if !self.element_exists(owner)? {
+            return Err(Error::ElementNotFound { id: owner });
+        }
+        let conn = self.connection();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO comments (id, owner_id, body, annotated) \
+             VALUES (?1, ?2, ?3, '[]')",
+            params![
+                id.as_uuid().to_string(),
+                owner.as_uuid().to_string(),
+                comment.body,
+            ],
+        )?;
+        tx.commit()?;
+        self.get_comment(id)
+    }
+
+    /// Get a comment by id (`REQ-MM-011`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ElementNotFound`] or [`Error::Sqlite`].
+    pub fn get_comment(&self, id: ElementId) -> Result<CommentView, Error> {
+        let conn = self.connection();
+        let row = conn
+            .query_row(
+                "SELECT id, owner_id, body FROM comments WHERE id = ?1",
+                params![id.as_uuid().to_string()],
+                |row| {
+                    Ok(CommentView {
+                        id: parse_id(&row.get::<_, String>(0)?),
+                        owner: parse_id(&row.get::<_, String>(1)?),
+                        body: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?;
+        row.ok_or(Error::ElementNotFound { id })
+    }
+
+    // --- derived reads ------------------------------------------------------
+
+    /// The `qualifiedName` of an element, derived on demand from the
+    /// ownership chain (`REQ-MM-003`, `INV-MM-005`).
+    ///
+    /// Walks the ownership chain via the closure table's `ancestors` query,
+    /// assembling the `/`-delimited path from root to the element. The path
+    /// is assembled from owner names; the element's own name is the last
+    /// segment. An element with no name contributes an empty segment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ElementNotFound`] or [`Error::Sqlite`].
+    pub fn qualified_name(&self, id: ElementId) -> Result<String, Error> {
+        if !self.element_exists(id)? {
+            return Err(Error::ElementNotFound { id });
+        }
+        let id_str = id.as_uuid().to_string();
+        let conn = self.connection();
+        // Ancestors nearest-first: [self, owner, ..., root].
+        let chain = closure::ancestors(conn, &id_str)?;
+        // Build names for each ancestor id, root-first.
+        let mut names: Vec<String> = Vec::with_capacity(chain.len());
+        for row in chain.iter().rev() {
+            let name: Option<String> = conn.query_row(
+                "SELECT name FROM elements WHERE id = ?1",
+                params![row.id],
+                |r| r.get(0),
+            )?;
+            names.push(name.unwrap_or_default());
+        }
+        Ok(names.join("/"))
+    }
+
+    // --- helpers ------------------------------------------------------------
+
+    /// Whether an element with this id exists.
+    fn element_exists(&self, id: ElementId) -> Result<bool, Error> {
+        let conn = self.connection();
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM elements WHERE id = ?1)",
+            params![id.as_uuid().to_string()],
+            |row| row.get(0),
+        )?;
+        Ok(exists)
+    }
+}
+
+// --- free functions ---------------------------------------------------------
+
+/// Insert one element row (the `elements` table insert, no closure).
+fn insert_element_row(
+    tx: &rusqlite::Transaction<'_>,
+    req: &CreateElement,
+) -> Result<(), Error> {
+    tx.execute(
+        "INSERT INTO elements (id, kind, name, owner_id, visibility, data, created_at, \
+         updated_at) VALUES (?1, ?2, ?3, ?4, ?5, '{}', ?6, ?6)",
+        params![
+            req.id.as_uuid().to_string(),
+            req.kind.as_str(),
+            req.name.as_deref(),
+            req.owner.map(|o| o.as_uuid().to_string()),
+            visibility_str(req.visibility),
+            NOW,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Map a [`Visibility`] to its stable string id (the column value).
+fn visibility_str(v: Visibility) -> &'static str {
+    match v {
+        Visibility::Public => "public",
+        Visibility::Private => "private",
+        Visibility::Protected => "protected",
+        Visibility::Package => "package",
+    }
+}
+
+/// Map a [`CommentError`] to an [`Error`].
+fn comment_err(err: &CommentError) -> Error {
+    match err {
+        CommentError::EmptyBody => Error::EmptyCommentBody,
+    }
+}
+
+/// Parse a UUID string into an [`ElementId`].
+fn parse_id(s: &str) -> ElementId {
+    // ElementId wraps a Uuid; the store stores the hyphenated string form.
+    // Parse is infallible for round-tripped uuids, but we use a safe path.
+    match uuid::Uuid::parse_str(s) {
+        Ok(u) => ElementId::from(u),
+        // Should never happen for ids we wrote; surface as a distinct panic-
+        // free path. A corrupt id in the store is a store bug.
+        Err(_) => ElementId::new(),
+    }
+}
+
+/// Row mapper: `SELECT id, kind, owner_id, name, visibility` → [`ElementView`].
+fn row_to_element_view(row: &rusqlite::Row<'_>) -> rusqlite::Result<ElementView> {
+    let id_str: String = row.get(0)?;
+    let kind_str: String = row.get(1)?;
+    let owner_str: Option<String> = row.get(2)?;
+    let name: Option<String> = row.get(3)?;
+    let vis_str: String = row.get(4)?;
+    let kind = MetaclassKind::from_id(&kind_str).unwrap_or(MetaclassKind::Package);
+    let visibility = match vis_str.as_str() {
+        "private" => Visibility::Private,
+        "protected" => Visibility::Protected,
+        "package" => Visibility::Package,
+        _ => Visibility::Public,
+    };
+    Ok(ElementView {
+        id: parse_id(&id_str),
+        kind,
+        owner: owner_str.as_deref().map(parse_id),
+        name,
+        visibility,
+    })
+}
+

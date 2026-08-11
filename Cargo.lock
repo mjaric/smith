@@ -2939,6 +2939,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "smith-model"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "smith-core",
+ "smith-store",
+ "tempfile",
+ "thiserror 2.0.20",
+ "uuid",
+]
+
+[[package]]
 name = "smith-store"
 version = "0.1.0"
 dependencies = [
