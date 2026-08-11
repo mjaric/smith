@@ -11,9 +11,7 @@
 use std::path::Path;
 
 use rusqlite::{params, Connection, OptionalExtension};
-use smith_core::{
-    Comment, CommentError, ElementId, MetaclassKind, MetaclassScope, Visibility,
-};
+use smith_core::{Comment, CommentError, ElementId, MetaclassKind, MetaclassScope, Visibility};
 use smith_store::closure;
 
 use crate::error::Error;
@@ -331,11 +329,7 @@ impl Model {
         let tx = conn.unchecked_transaction()?;
         tx.execute(
             "UPDATE elements SET owner_id = ?1, updated_at = ?2 WHERE id = ?3",
-            params![
-                new_owner.map(|o| o.as_uuid().to_string()),
-                NOW,
-                id_str,
-            ],
+            params![new_owner.map(|o| o.as_uuid().to_string()), NOW, id_str,],
         )?;
         closure::update_on_reparent(
             &tx,
@@ -476,7 +470,8 @@ impl Model {
                 },
             )
             .optional()?;
-        let (id_str, kind, source, target, owner) = row.ok_or(Error::RelationshipNotFound { id })?;
+        let (id_str, kind, source, target, owner) =
+            row.ok_or(Error::RelationshipNotFound { id })?;
         Ok(RelationshipView {
             id: parse_id(&id_str)?,
             kind,
@@ -730,4 +725,3 @@ fn row_to_element_view(raw: RawElementRow) -> Result<ElementView, Error> {
         visibility,
     })
 }
-
